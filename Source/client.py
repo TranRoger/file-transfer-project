@@ -44,7 +44,10 @@ class FileDownloader:
             return None
             
         try:
-            data = sock.recv(1024)
+            request = {'action': 'get_files_list'}
+            sock.sendall(json.dumps(request).encode())
+            
+            data = sock.recv(4096)
             files_info = json.loads(data.decode())
             return files_info
         except Exception as e:
@@ -52,7 +55,7 @@ class FileDownloader:
             return None
         finally:
             sock.close()
-    
+
     def get_file_size(self, file_name):
         sock = self.connect_to_server()
         if not sock:
@@ -64,8 +67,7 @@ class FileDownloader:
             
             response = sock.recv(1024).decode()
             response_data = json.loads(response)
-            # log
-            print(f"Received file size response: {response_data}")
+            
             if response_data['status'] == 'success':
                 return response_data['file_size']
             else:
@@ -76,7 +78,7 @@ class FileDownloader:
             return None
         finally:
             sock.close()
-    
+                
     def download_chunk(self, file_name, chunk_index, total_chunks, offset, chunk_size, progress_dict):
         sock = self.connect_to_server()
         if not sock:
@@ -167,43 +169,44 @@ class FileDownloader:
             return False
     
     def display_progress(self, file_name, progress_dict):
+        # First print the server response
+        print(f"Starting download for {file_name}")
+        
+        # Then start the progress display
         while not progress_dict.get('complete', False) and not self.stop_event.is_set():
             with self.lock:
                 parts = progress_dict['parts']
                 total_progress = (progress_dict['downloaded'] / progress_dict['total_size']) * 100
                 
-                # Clear previous output
-                print('\033[F' * (len(parts) + 1), end='')
+                # Move cursor up to overwrite previous progress
+                line_count = len(parts) + 1  # +1 for the total progress line
+                print(f"\033[{line_count}A", end='')  # Move up N lines
                 
-                print(f"Downloading {file_name} - Overall: {total_progress:.2f}%")
+                # Print new progress
+                print(f"Total Progress: {total_progress:.2f}%".ljust(80))
                 for i, progress in enumerate(parts):
-                    print(f"  Part {i+1}: {progress:.2f}%")
+                    print(f"Part {i+1}: {progress:.2f}%".ljust(80))
+                
+                # Flush output to ensure immediate display
+                sys.stdout.flush()
             
-            time.sleep(0.5)
-    
+            time.sleep(0.2)
+        
+        # After completion, move cursor down so new output doesn't overwrite
+        print("\n" * (len(progress_dict['parts']) + 1))
+
     def download_file(self, file_name):
         if file_name in self.downloaded_files:
             return
-            
-        print(f"Starting download for {file_name}")
         
-        # Get file size
+        # Get file size first
         file_size = self.get_file_size(file_name)
         if file_size is None:
             print(f"Failed to get size for {file_name}")
             return
-            
-        # Calculate chunk sizes (4 parts)
-        num_chunks = 4
-        chunk_size = file_size // num_chunks
-        chunks = []
-        
-        for i in range(num_chunks):
-            offset = i * chunk_size
-            size = chunk_size if i < num_chunks - 1 else file_size - offset
-            chunks.append((i, offset, size))
         
         # Initialize progress tracking
+        num_chunks = 4
         progress_dict = {
             'total_size': file_size,
             'downloaded': 0,
@@ -211,7 +214,10 @@ class FileDownloader:
             'complete': False
         }
         
-        # Start progress display thread
+        # Make space for progress display
+        print("\n" * (num_chunks + 2))  # +2 for total progress and spacing
+        
+        # Start progress thread
         progress_thread = threading.Thread(
             target=self.display_progress,
             args=(file_name, progress_dict)
@@ -221,15 +227,18 @@ class FileDownloader:
         
         # Start download threads
         threads = []
-        for chunk_index, offset, size in chunks:
+        chunk_size = file_size // num_chunks
+        for i in range(num_chunks):
+            offset = i * chunk_size
+            size = chunk_size if i < num_chunks - 1 else file_size - offset
             thread = threading.Thread(
                 target=self.download_chunk,
-                args=(file_name, chunk_index, num_chunks, offset, size, progress_dict)
+                args=(file_name, i, num_chunks, offset, size, progress_dict)
             )
             thread.start()
             threads.append(thread)
         
-        # Wait for all threads to complete
+        # Wait for downloads to complete
         for thread in threads:
             thread.join()
         
@@ -243,7 +252,10 @@ class FileDownloader:
         # Merge chunks
         if self.merge_chunks(file_name, num_chunks):
             self.downloaded_files.add(file_name)
-    
+            print(f"\nDownload completed: {file_name}")
+        else:
+            print(f"\nDownload failed: {file_name}")
+
     def monitor_input_file(self, input_file='input.txt'):
         last_modified = 0
         processed_files = set()
