@@ -1,95 +1,65 @@
-import os
 import socket
-import threading
+import os
 import json
-import hashlib
 
-SERVER_IP = "10.250.91.1"
-SERVER_PORT = 12345
-class FileServer:
-    def __init__(self, host=SERVER_IP, port=SERVER_PORT):
-        self.host = host
-        self.port = port
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        self.files_info = self.load_files_info('files_list.txt')
-        self.lock = threading.Lock()
-        
-    def load_files_info(self, filename):
-        files_info = {}
-        if os.path.exists(filename):
-            with open(filename, 'r') as f:
-                for line in f:
-                    if line.strip():
-                        parts = line.strip().split()
-                        if len(parts) >= 2:
-                            file_name = ' '.join(parts[:-1])
-                            size = parts[-1]
-                            files_info[file_name] = {
-                                'size': size,
-                                'path': os.path.join('server_files', file_name)
-                            }
-        return files_info
-    
-    def calculate_checksum(self, data):
-        return hashlib.md5(data).hexdigest()
-    
-    def handle_client(self, client_socket, address):
-        print(f"Connection from {address} established.")
-        
-        try:
-            while True:
-                # Wait for request from client first
-                request_data = client_socket.recv(1024).decode()
-                if not request_data:
-                    break
-                    
-                try:
-                    request = json.loads(request_data)
-                    action = request.get('action')
-                    
-                    if action == 'get_files_list':
-                        # Send list of available files
-                        files_list = json.dumps(self.files_info).encode()
-                        client_socket.sendall(files_list)
-                    
-                    elif action == 'get_file_size':
-                        file_name = request['file_name']
-                        if file_name in self.files_info:
-                            file_path = self.files_info[file_name]['path']
-                            file_size = os.path.getsize(file_path)
-                            response = {'status': 'success', 'file_size': file_size}
-                        else:
-                            response = {'status': 'error', 'message': 'File not found'}
-                        client_socket.sendall(json.dumps(response).encode())
-                    
-                    elif action == 'download':
-                        # Existing download handling code...
-                        pass
-                        
-                except Exception as e:
-                    print(f"Error processing request: {e}")
-                    response = {'status': 'error', 'message': str(e)}
-                    client_socket.sendall(json.dumps(response).encode())
-                    
-        except Exception as e:
-            print(f"Error with client {address}: {e}")
-        finally:
-            client_socket.close()
-            print(f"Connection from {address} closed.")
+def send_file_chunk(sock, client_addr, file_name, offset, length):
+    """Send a file chunk using UDP with sequence numbering."""
+    try:
+        with open(file_name, "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
             
-    def start(self):
-        print(f"Server started on {self.host}:{self.port}")
-        while True:
-            client_socket, address = self.server_socket.accept()
-            client_thread = threading.Thread(target=self.handle_client, args=(client_socket, address))
-            client_thread.daemon = True
-            client_thread.start()
-
-if __name__ == '__main__':
-    if not os.path.exists('server_files'):
-        os.makedirs('server_files')
+            # Prepare packet metadata
+            packet_metadata = {
+                "file_name": file_name,
+                "offset": offset,
+                "total_length": length,
+                "chunk_length": len(data)
+            }
+            
+            # Send metadata first
+            sock.sendto(json.dumps(packet_metadata).encode(), client_addr)
+            
+            # Send data in smaller chunks
+            chunk_size = 1024
+            for i in range(0, len(data), chunk_size):
+                chunk = data[i:i+chunk_size]
+                sequence_packet = {
+                    "sequence": i // chunk_size,
+                    "data": chunk.decode('latin-1') if isinstance(chunk, bytes) else chunk
+                }
+                sock.sendto(json.dumps(sequence_packet).encode(), client_addr)
     
-    server = FileServer()
-    server.start()
+    except FileNotFoundError:
+        error_msg = json.dumps({"error": f"File {file_name} not found"})
+        sock.sendto(error_msg.encode(), client_addr)
+
+def main():
+    """Start the UDP server and handle file transfer requests."""
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("10.250.91.1", 12345))
+    print("UDP Server listening on port 12345...")
+
+    while True:
+        # Receive request
+        data, client_addr = server.recvfrom(1024)
+        request = data.decode()
+
+        if request == "LIST":
+            # Send list of available files
+            with open("files.txt", "r") as f:
+                files_list = f.read()
+            server.sendto(files_list.encode(), client_addr)
+        
+        elif request.startswith("DOWNLOAD"):
+            # Parse download request
+            parts = request.split()
+            file_name = parts[1]
+            offset = int(parts[2])
+            length = int(parts[3])
+            
+            # Send file chunk
+            send_file_chunk(server, client_addr, file_name, offset, length)
+
+if __name__ == "__main__":
+    main()
