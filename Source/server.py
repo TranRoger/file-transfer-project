@@ -1,38 +1,175 @@
 import socket
-import os
 import json
+import hashlib
+import time
 
+class FileTransferProtocol:
+    """Application-level protocol for reliable file transfer."""
+    # Protocol constants
+    START_CHUNK = 'START'
+    DATA_CHUNK = 'DATA'
+    END_CHUNK = 'END'
+    ACK = 'ACK'
+    NACK = 'NACK'
+
+    @staticmethod
+    def create_packet(packet_type, file_name, sequence, data=None, total_chunks=None, checksum=None):
+        """Create a structured packet for file transfer."""
+        packet = {
+            'type': packet_type,
+            'file_name': file_name,
+            'sequence': sequence
+        }
+        
+        if data is not None:
+            packet['data'] = data.decode('latin-1') if isinstance(data, bytes) else data
+        
+        if total_chunks is not None:
+            packet['total_chunks'] = total_chunks
+        
+        if checksum is not None:
+            packet['checksum'] = checksum
+        
+        return json.dumps(packet).encode()
+
+    @staticmethod
+    def verify_checksum(data, expected_checksum):
+        """Verify data integrity using MD5 checksum."""
+        current_checksum = hashlib.md5(data).hexdigest()
+        return current_checksum == expected_checksum
+
+"""
 def send_file_chunk(sock, client_addr, file_name, offset, length):
-    """Send a file chunk using UDP with sequence numbering."""
     try:
         with open(file_name, "rb") as f:
             f.seek(offset)
             data = f.read(length)
             
-            # Prepare packet metadata
-            packet_metadata = {
-                "file_name": file_name,
-                "offset": offset,
-                "total_length": length,
-                "chunk_length": len(data)
-            }
-            
-            # Send metadata first
-            sock.sendto(json.dumps(packet_metadata).encode(), client_addr)
-            
-            # Send data in smaller chunks
+            # Calculate total chunks and chunk size
             chunk_size = 1024
-            for i in range(0, len(data), chunk_size):
-                chunk = data[i:i+chunk_size]
-                sequence_packet = {
-                    "sequence": i // chunk_size,
-                    "data": chunk.decode('latin-1') if isinstance(chunk, bytes) else chunk
-                }
-                sock.sendto(json.dumps(sequence_packet).encode(), client_addr)
+            total_chunks = (len(data) + chunk_size - 1) // chunk_size
+            
+            # Send START packet
+            start_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.START_CHUNK, 
+                file_name, 
+                0, 
+                total_chunks=total_chunks
+            )
+            sock.sendto(start_packet, client_addr)
+            
+            # Send data chunks
+            for seq in range(total_chunks):
+                chunk = data[seq*chunk_size : (seq+1)*chunk_size]
+                
+                # Calculate checksum for this chunk
+                checksum = hashlib.md5(chunk).hexdigest()
+                
+                # Create and send data packet
+                data_packet = FileTransferProtocol.create_packet(
+                    FileTransferProtocol.DATA_CHUNK, 
+                    file_name, 
+                    seq, 
+                    data=chunk, 
+                    checksum=checksum
+                )
+                sock.sendto(data_packet, client_addr)
+                
+                # Wait for ACK with timeout
+                try:
+                    sock.settimeout(2)  # 2-second timeout
+                    response, _ = sock.recvfrom(1024)
+                    ack_packet = json.loads(response.decode())
+                    
+                    # If NACK received, resend chunk
+                    if ack_packet['type'] == FileTransferProtocol.NACK:
+                        # Resend the chunk immediately
+                        sock.sendto(data_packet, client_addr)
+                except socket.timeout:
+                    # Timeout - resend chunk
+                    sock.sendto(data_packet, client_addr)
+            
+            # Send END packet
+            end_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.END_CHUNK, 
+                file_name, 
+                total_chunks
+            )
+            sock.sendto(end_packet, client_addr)
     
     except FileNotFoundError:
-        error_msg = json.dumps({"error": f"File {file_name} not found"})
-        sock.sendto(error_msg.encode(), client_addr)
+        error_packet = FileTransferProtocol.create_packet(
+            'ERROR', 
+            file_name, 
+            0, 
+            data=f"File {file_name} not found"
+        )
+        sock.sendto(error_packet, client_addr)
+"""
+        
+def send_file_chunk(sock, client_addr, file_name, offset, length):
+    """Send a file chunk using enhanced UDP protocol."""
+    try:
+        with open(file_name, "rb") as f:
+            f.seek(offset)
+            data = f.read(length)
+            
+            chunk_size = 1024
+            total_chunks = (len(data) + chunk_size - 1) // chunk_size
+            
+            # Send START packet
+            start_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.START_CHUNK, 
+                file_name, 
+                0, 
+                total_chunks=total_chunks
+            )
+            sock.sendto(start_packet, client_addr)
+            
+            # Send data chunks
+            for seq in range(total_chunks):
+                chunk = data[seq*chunk_size : (seq+1)*chunk_size]
+                checksum = hashlib.md5(chunk).hexdigest()
+                
+                data_packet = FileTransferProtocol.create_packet(
+                    FileTransferProtocol.DATA_CHUNK, 
+                    file_name, 
+                    seq, 
+                    data=chunk, 
+                    checksum=checksum
+                )
+                sock.sendto(data_packet, client_addr)
+                
+                # Wait for ACK with timeout
+                try:
+                    sock.settimeout(2)
+                    response, _ = sock.recvfrom(1024)
+                    try:
+                        ack_packet = json.loads(response.decode())
+                        if ack_packet['type'] == FileTransferProtocol.NACK:
+                            sock.sendto(data_packet, client_addr)
+                    except json.JSONDecodeError:
+                        # If response isn't valid JSON, treat as NACK
+                        sock.sendto(data_packet, client_addr)
+                except socket.timeout:
+                    sock.sendto(data_packet, client_addr)
+            
+            # Send END packet
+            end_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.END_CHUNK, 
+                file_name, 
+                total_chunks
+            )
+            sock.sendto(end_packet, client_addr)
+    
+    except FileNotFoundError:
+        error_packet = FileTransferProtocol.create_packet(
+            'ERROR', 
+            file_name, 
+            0, 
+            data=f"File {file_name} not found"
+        )
+        sock.sendto(error_packet, client_addr)
 
 def main():
     """Start the UDP server and handle file transfer requests."""

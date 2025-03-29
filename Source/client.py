@@ -5,10 +5,22 @@ import time
 import os
 import signal
 import sys
+import hashlib
 
-server_address = ("10.250.91.1", 12345)
-progress_lock = threading.Lock()
-processed = set()  # Track processed files
+class FileTransferProtocol:
+    """Application-level protocol for reliable file transfer."""
+    # Protocol constants
+    START_CHUNK = 'START'
+    DATA_CHUNK = 'DATA'
+    END_CHUNK = 'END'
+    ACK = 'ACK'
+    NACK = 'NACK'
+
+    @staticmethod
+    def verify_checksum(data, expected_checksum):
+        """Verify data integrity using MD5 checksum."""
+        current_checksum = hashlib.md5(data).hexdigest()
+        return current_checksum == expected_checksum
 
 def get_file_list(sock):
     """Get the list of available files from the server."""
@@ -25,50 +37,135 @@ def get_file_list(sock):
             files[name] = size
     return files
 
+"""
 def download_part(sock, file_name, offset, length, output_file, part_num, progress):
-    """Download a specific part of the file using UDP."""
     # Send download request
     request = f"DOWNLOAD {file_name} {offset} {length}".encode()
     sock.sendto(request, server_address)
 
     # Initialize storage for received data
     received_data = {}
-    metadata = None
     total_chunks = -1
+    file_metadata = None
 
-    while len(received_data) < total_chunks or total_chunks == -1:
+    while True:
         try:
             sock.settimeout(10)  # 10-second timeout
             data, _ = sock.recvfrom(2048)
             packet = json.loads(data.decode())
 
-            # Check if this is metadata packet
-            if "file_name" in packet:
-                metadata = packet
-                total_chunks = (metadata['total_length'] + 1023) // 1024
+            # Handle different packet types
+            if packet['type'] == FileTransferProtocol.START_CHUNK:
+                total_chunks = packet.get('total_chunks', -1)
+                file_metadata = packet
                 continue
 
-            # Chunk data packet
-            if metadata and 'sequence' in packet:
-                received_data[packet['sequence']] = packet['data']
+            elif packet['type'] == FileTransferProtocol.DATA_CHUNK:
+                # Verify checksum
+                chunk_data = packet['data'].encode('latin-1')
+                checksum = packet['checksum']
+                
+                if FileTransferProtocol.verify_checksum(chunk_data, checksum):
+                    # ACK the chunk
+                    ack_packet = json.dumps({
+                        'type': FileTransferProtocol.ACK,
+                        'sequence': packet['sequence']
+                    }).encode()
+                    sock.sendto(ack_packet, server_address)
+                    
+                    # Store the chunk
+                    received_data[packet['sequence']] = chunk_data
+                    
+                    # Update progress
+                    with progress_lock:
+                        progress[part_num] = (len(received_data) * 1024, length)
+                else:
+                    # Send NACK if checksum fails
+                    nack_packet = json.dumps({
+                        'type': FileTransferProtocol.NACK,
+                        'sequence': packet['sequence']
+                    }).encode()
+                    sock.sendto(nack_packet, server_address)
 
-                # Update progress
-                with progress_lock:
-                    progress[part_num] = (len(received_data) * 1024, length)
+            elif packet['type'] == FileTransferProtocol.END_CHUNK:
+                # Final chunk received, break the loop
+                break
 
         except socket.timeout:
             print(f"Timeout while downloading {file_name} part {part_num}")
             break
 
     # Reconstruct and write file
-    if metadata and len(received_data) == total_chunks:
+    if total_chunks > 0 and len(received_data) == total_chunks:
         # Reconstruct file data
-        file_data = b''.join(received_data[i].encode('latin-1') if isinstance(received_data[i], str) else received_data[i] 
-                              for i in range(total_chunks))
+        file_data = b''.join(received_data[i] for i in range(total_chunks))
         
         with open(output_file, "r+b") as f:
             f.seek(offset)
             f.write(file_data[:length])
+"""
+def download_part(sock, file_name, offset, length, output_file, part_num, progress):
+    """Download a specific part of the file using enhanced UDP protocol."""
+    request = f"DOWNLOAD {file_name} {offset} {length}".encode()
+    sock.sendto(request, server_address)
+
+    received_data = {}
+    total_chunks = -1
+    chunk_size = 1024  # Must match server's chunk_size
+
+    while True:
+        try:
+            sock.settimeout(10)
+            data, _ = sock.recvfrom(2048)
+            packet = json.loads(data.decode())
+
+            if packet['type'] == FileTransferProtocol.START_CHUNK:
+                total_chunks = packet.get('total_chunks', -1)
+                continue
+
+            elif packet['type'] == FileTransferProtocol.DATA_CHUNK:
+                chunk_data = packet['data'].encode('latin-1')
+                checksum = packet['checksum']
+                
+                if FileTransferProtocol.verify_checksum(chunk_data, checksum):
+                    ack_packet = json.dumps({
+                        'type': FileTransferProtocol.ACK,
+                        'sequence': packet['sequence']
+                    }).encode()
+                    sock.sendto(ack_packet, server_address)
+                    
+                    received_data[packet['sequence']] = chunk_data
+                    
+                    # Update progress immediately upon receiving chunk
+                    with progress_lock:
+                        received = len(received_data) * chunk_size
+                        progress[part_num] = (min(received, length), length)
+                else:
+                    nack_packet = json.dumps({
+                        'type': FileTransferProtocol.NACK,
+                        'sequence': packet['sequence']
+                    }).encode()
+                    sock.sendto(nack_packet, server_address)
+
+            elif packet['type'] == FileTransferProtocol.END_CHUNK:
+                break
+
+        except socket.timeout:
+            print(f"Timeout while downloading {file_name} part {part_num}")
+            break
+        except json.JSONDecodeError:
+            print(f"Invalid packet received for {file_name} part {part_num}")
+            continue
+
+    if total_chunks > 0 and len(received_data) == total_chunks:
+        file_data = b''.join(received_data[i] for i in range(total_chunks))
+        with open(output_file, "r+b") as f:
+            f.seek(offset)
+            f.write(file_data[:length])
+
+server_address = ("10.250.91.1", 12345)
+progress_lock = threading.Lock()
+processed = set()  # Track processed files
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully."""
