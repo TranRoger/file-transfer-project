@@ -14,6 +14,8 @@ lock = threading.Lock()  # To ensure thread safety
 client_queues = {}  # Dictionary of queues for each client
 client_processors = {}  # Dictionary of processor threads for each client
 active_transfers = {}  # Dictionary to store ongoing file transfers
+# Store chunks for resending in case of NACKs
+transfer_chunks = {}  # Dictionary to store sent chunks for each transfer_id
 
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
@@ -132,6 +134,10 @@ def handle_client_request(server, client_addr, client_key, parsed):
         # Create a unique transfer ID for this request
         transfer_id = f"{client_key}_{parsed['file_name']}_{uuid.uuid4().hex[:8]}"
         
+        # Create a dictionary to store sent chunks for this transfer
+        with lock:
+            transfer_chunks[transfer_id] = {}
+        
         # Create and start a new thread for this file transfer
         transfer_thread = threading.Thread(
             target=send_file_chunk,
@@ -162,14 +168,43 @@ def handle_ack_nack(server, client_addr, client_key, parsed):
         for transfer_id, transfer_info in active_transfers.items():
             if transfer_info['client_key'] == client_key and transfer_info['file_name'] == file_name:
                 if parsed["type"] == FileTransferProtocol.NACK:
-                    # If NACK, could implement resend logic here
-                    print(f"Received NACK for {file_name}, sequence {sequence}. Implementing resend would go here.")
-                    
-
+                    # Handle NACK by resending the chunk
+                    resend_chunk(server, client_addr, transfer_id, sequence)
                 elif parsed["type"] == FileTransferProtocol.ACK:
-                    # If ACK, could update progress tracking here
+                    # If ACK, update progress tracking
                     print(f"Received ACK for {file_name}, sequence {sequence}")
+                    # We could potentially remove the ACKed chunk from memory to save space
+                    # But keeping it for now in case we need to resend it later
                 break
+
+def resend_chunk(server, client_addr, transfer_id, sequence):
+    """Resend a specific chunk to the client."""
+    try:
+        with lock:
+            if transfer_id in transfer_chunks and sequence in transfer_chunks[transfer_id]:
+                chunk_info = transfer_chunks[transfer_id][sequence]
+                file_name = chunk_info['file_name']
+                chunk_data = chunk_info['data']
+                checksum = chunk_info['checksum']
+                client_port = chunk_info['client_port']
+                
+                print(f"Resending chunk {sequence} for {file_name} to {client_addr[0]}:{client_port}")
+                
+                # Recreate the data packet with the cached data
+                data_packet = FileTransferProtocol.create_packet(
+                    FileTransferProtocol.DATA_CHUNK,
+                    file_name,
+                    sequence,
+                    data=chunk_data,
+                    checksum=checksum,
+                    client_port=client_port
+                )
+                server.sendto(data_packet, client_addr)
+                print(f"Resent chunk {sequence} for {file_name}")
+            else:
+                print(f"Warning: Chunk {sequence} not found in transfer {transfer_id} cache")
+    except Exception as e:
+        print(f"Error resending chunk {sequence} for transfer {transfer_id}: {e}")
 
 def send_file_chunk(sock, client_addr, client_key, parsed, transfer_id):
     """Send file in chunks with status tracking."""
@@ -216,6 +251,15 @@ def send_file_chunk(sock, client_addr, client_key, parsed, transfer_id):
                 with lock:
                     if transfer_id in active_transfers:
                         active_transfers[transfer_id]['current_chunk'] = seq
+                    
+                    # Store chunk data for potential resending
+                    if transfer_id in transfer_chunks:
+                        transfer_chunks[transfer_id][seq] = {
+                            'file_name': file_name,
+                            'data': chunk,
+                            'checksum': checksum,
+                            'client_port': client_port
+                        }
                 
                 data_packet = FileTransferProtocol.create_packet(
                     FileTransferProtocol.DATA_CHUNK,
@@ -229,7 +273,7 @@ def send_file_chunk(sock, client_addr, client_key, parsed, transfer_id):
                 print(f"Sent chunk {seq}/{total_chunks} for {file_name} to {client_key}")
                 
                 # Small delay to prevent overwhelming network/receiver
-                time.sleep(0.001)
+                time.sleep(0.002)
             
             # Send END packet
             end_packet = FileTransferProtocol.create_packet(
@@ -280,13 +324,15 @@ def send_file_chunk(sock, client_addr, client_key, parsed, transfer_id):
                 active_transfers[transfer_id]['error'] = error_msg
     
     finally:
-        # Clean up transfer after a delay to allow for any final ACKs
+        # Clean up transfer after a delay to allow for any final ACKs or NACKs
         def cleanup_transfer():
-            time.sleep(5)  # Wait 5 seconds before cleanup
+            time.sleep(30)  # Wait longer before cleanup to allow for resends
             with lock:
                 if transfer_id in active_transfers:
                     del active_transfers[transfer_id]
-                    print(f"Cleaned up transfer {transfer_id}")
+                if transfer_id in transfer_chunks:
+                    del transfer_chunks[transfer_id]
+                print(f"Cleaned up transfer {transfer_id}")
         
         cleanup_thread = threading.Thread(target=cleanup_transfer)
         cleanup_thread.daemon = True
@@ -308,6 +354,11 @@ def monitor_thread():
                 print(f"Active clients: {len(client_queues)}")
                 for client_key in client_queues:
                     print(f"  {client_key}: queue size {client_queues[client_key].qsize()}")
+            
+            # Report memory usage of chunk cache
+            if transfer_chunks:
+                total_chunks = sum(len(chunks) for chunks in transfer_chunks.values())
+                print(f"Cached chunks: {total_chunks} chunks across {len(transfer_chunks)} transfers")
 
 def main():
     """Start the UDP server with improved client handling."""
