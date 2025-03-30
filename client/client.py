@@ -1,164 +1,343 @@
 import socket
-import threading
 import os
+import json
+import threading
 import time
-import math
+from collections import defaultdict
 
-# Configuration
-SERVER_HOST = '10.210.29.123'
-SERVER_PORT = 5000
-INPUT_FILE = 'input.txt'
-DOWNLOAD_DIR = 'downloads'
-CHUNK_SIZE = 1024
-NUM_CONNECTIONS = 4
-RECV_TIMEOUT = 2
+class UDPClient:
+    def __init__(self, server_ip='10.210.29.1', server_port=5000):
+        self.server_ip = server_ip
+        self.server_port = server_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(5.0)
+        self.input_file = "input.txt"
+        self.downloaded_files = set()
+        self.chunk_size = 1024 * 1024  # 1MB chunk size
+        self.max_connections = 4
+        self.active_downloads = defaultdict(dict)
+        self.lock = threading.Lock()
+        
+        # Create input file if not exists
+        if not os.path.exists(self.input_file):
+            with open(self.input_file, 'w') as f:
+                f.write("# Add files to download, one per line\n")
 
-# Store downloaded chunks
-downloaded_chunks = {}
-download_complete = {}
+    def get_file_list(self):
+        """Request list of available files from server"""
+        request = {"type": "list"}
+        self.sock.sendto(json.dumps(request).encode(), (self.server_ip, self.server_port))
+        
+        try:
+            data, _ = self.sock.recvfrom(65536)  # Large buffer for file list
+            response = json.loads(data.decode())
+            if response.get("type") == "list":
+                return response.get("files", {})
+        except socket.timeout:
+            print("Timeout while waiting for file list")
+        except json.JSONDecodeError:
+            print("Invalid response from server")
+        
+        return {}
 
-# Function to get file list from server
-def get_file_list():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    print(f"Client: Sending GET_FILE_LIST to {SERVER_HOST}:{SERVER_PORT}")  # Add this line
-    sock.settimeout(5)  # Add this line (timeout in seconds)
-    sock.sendto(b"GET_FILE_LIST", (SERVER_HOST, SERVER_PORT))
-    try:
-        data, addr = sock.recvfrom(4096)
-        print(f"Client: Received data: {data.decode('utf-8')}")  # Add this line
-        file_list = data.decode('utf-8').split('\n')
-        return [file.split() for file in file_list]
-    except socket.timeout:
-        print("Client: Timeout waiting for file list")  # Add this line
-        return []
+    def send_ack(self, filename, chunk_id, seq_num, server_addr):
+        """Send ACK for received packet"""
+        ack = {
+            "type": "ack",
+            "filename": filename,
+            "chunk_id": chunk_id,
+            "seq_num": seq_num
+        }
+        self.sock.sendto(json.dumps(ack).encode(), server_addr)
 
-# Function to download a chunk
-def download_chunk(file_name, offset, sock, chunk_id, total_chunks, event):
-    sock.settimeout(RECV_TIMEOUT)
-    
-    try:
-        sock.sendto(f"GET {file_name} {offset} {chunk_id}".encode('utf-8'), (SERVER_HOST, SERVER_PORT))
-        print(f"Downloading chunk {chunk_id} of {file_name} from offset {offset}")
+    def download_chunk(self, filename, chunk_id, offset, chunk_size):
+        """Download a specific chunk of a file"""
+        temp_filename = f"{filename}.part{chunk_id}"
+        received_packets = set()
+        
+        request = {
+            "type": "download",
+            "filename": filename,
+            "chunk_id": chunk_id,
+            "offset": offset,
+            "chunk_size": chunk_size
+        }
+        
+        self.sock.sendto(json.dumps(request).encode(), (self.server_ip, self.server_port))
+        
+        with open(temp_filename, 'wb') as f:
+            while True:
+                try:
+                    data, server_addr = self.sock.recvfrom(65536)  # Large buffer for file data
+                    packet = json.loads(data.decode())
+                    
+                    if packet.get("type") == "data":
+                        seq_num = packet.get("seq_num")
+                        if seq_num not in received_packets:
+                            # Write the data to file
+                            f.write(bytes.fromhex(packet.get("data")))
+                            received_packets.add(seq_num)
+                            
+                            # Update progress
+                            with self.lock:
+                                if filename in self.active_downloads and chunk_id in self.active_downloads[filename]:
+                                    self.active_downloads[filename][chunk_id]["received"] = len(received_packets)
+                                    self.active_downloads[filename][chunk_id]["total"] = packet.get("total_packets", 1)
+                            
+                            # Send ACK
+                            self.send_ack(filename, chunk_id, seq_num, server_addr)
+                    
+                    elif packet.get("type") == "end":
+                        # End of chunk received
+                        with self.lock:
+                            if filename in self.active_downloads and chunk_id in self.active_downloads[filename]:
+                                self.active_downloads[filename][chunk_id]["complete"] = True
+                        break
+                    
+                    elif packet.get("type") == "error":
+                        print(f"Error downloading {filename} chunk {chunk_id}: {packet.get('message')}")
+                        break
+                
+                except socket.timeout:
+                    print(f"Timeout while downloading {filename} chunk {chunk_id}")
+                    break
+                except json.JSONDecodeError:
+                    print("Invalid packet received")
+                    continue
+                except Exception as e:
+                    print(f"Error processing packet: {e}")
+                    break
+
+    def download_chunk(self, filename, chunk_id, offset, chunk_size):
+        """Download a specific chunk of a file with progress tracking"""
+        temp_filename = f"{filename}.part{chunk_id}"
+        received_bytes = 0
+        total_bytes = chunk_size
+        
+        try:
+            # Initialize progress tracking
+            with self.lock:
+                if filename not in self.active_downloads:
+                    self.active_downloads[filename] = {}
+                self.active_downloads[filename][chunk_id] = {
+                    "received": 0,
+                    "total": total_bytes,
+                    "complete": False
+                }
+            
+            request = {
+                "type": "download",
+                "filename": filename,
+                "chunk_id": chunk_id,
+                "offset": offset,
+                "chunk_size": chunk_size
+            }
+            
+            self.sock.sendto(json.dumps(request).encode(), (self.server_ip, self.server_port))
+            
+            with open(temp_filename, 'wb') as f:
+                while True:
+                    data, server_addr = self.sock.recvfrom(65536)
+                    packet = json.loads(data.decode())
+                    
+                    if packet.get("type") == "data":
+                        packet_data = bytes.fromhex(packet.get("data", ""))
+                        f.write(packet_data)
+                        received_bytes += len(packet_data)
+                        
+                        # Update progress
+                        with self.lock:
+                            self.active_downloads[filename][chunk_id]["received"] = received_bytes
+                        
+                        # Send ACK
+                        self.send_ack(filename, chunk_id, packet.get("seq_num"), server_addr)
+                    
+                    elif packet.get("type") == "end":
+                        with self.lock:
+                            self.active_downloads[filename][chunk_id]["complete"] = True
+                        break
+                    
+                    elif packet.get("type") == "error":
+                        print(f"Error downloading {filename} chunk {chunk_id}: {packet.get('message')}")
+                        break
+        
+        except Exception as e:
+            print(f"Error in chunk {chunk_id} of {filename}: {e}")
+            with self.lock:
+                if filename in self.active_downloads and chunk_id in self.active_downloads[filename]:
+                    self.active_downloads[filename][chunk_id]["failed"] = True
+
+    def download_file(self, filename, file_size):
+        """Download a file using multiple chunks"""
+        if filename in self.active_downloads:
+            print(f"{filename} is already being downloaded")
+            return
+        
+        # Calculate chunk sizes
+        chunk_size = max(file_size // self.max_connections, self.chunk_size)
+        total_chunks = (file_size + chunk_size - 1) // chunk_size
+        
+        # Initialize download tracking
+        with self.lock:
+            self.active_downloads[filename] = {
+                "size": file_size,
+                "total_chunks": total_chunks,
+                "completed_chunks": 0
+            }
+            
+            for i in range(total_chunks):
+                offset = i * chunk_size
+                current_chunk_size = min(chunk_size, file_size - offset)
+                self.active_downloads[filename][i] = {
+                    "offset": offset,
+                    "size": current_chunk_size,
+                    "received": 0,
+                    "total": 0,
+                    "complete": False
+                }
+        
+        # Start download threads
+        threads = []
+        for i in range(total_chunks):
+            t = threading.Thread(
+                target=self.download_chunk,
+                args=(filename, i, i * chunk_size, chunk_size)
+            )
+            t.start()
+            threads.append(t)
+        
+        # Display progress
+        self.display_progress(filename, total_chunks)
+        
+        # Wait for all threads to complete
+        for t in threads:
+            t.join()
+        
+        # Check if all chunks completed
+        all_complete = True
+        with self.lock:
+            for i in range(total_chunks):
+                if not self.active_downloads[filename][i].get("complete", False):
+                    all_complete = False
+                    break
+        
+        if all_complete:
+            if self.combine_chunks(filename, total_chunks):
+                self.downloaded_files.add(filename)
+        
+        # Clean up
+        with self.lock:
+            del self.active_downloads[filename]
+
+    def display_progress(self, filename, total_chunks):
+        """Display download progress for all chunks of a file"""
+        last_update = time.time()
         
         while True:
-            try:
-                data, addr = sock.recvfrom(CHUNK_SIZE + 64)  # Increased size for metadata
-                if data.startswith(b"CHUNK"):
-                    parts = data.decode('utf-8').split(' ', 2)
-                    recv_chunk_id = parts[1]
-                    chunk_length = int(parts[2])
-                    chunk_data = data[len(parts[0]) + len(parts[1]) + len(parts[2]) + 3:]
-                    if recv_chunk_id == chunk_id and len(chunk_data) == chunk_length:
-                        downloaded_chunks.setdefault(file_name, {}).setdefault(offset, b'').extend(chunk_data)
-                        sock.sendto(f"ACK {chunk_id}".encode('utf-8'), (SERVER_HOST, SERVER_PORT))
-                        event.set()
-                        break
-                    else:
-                        print(f"  Mismatch: expected chunk {chunk_id}, got {recv_chunk_id}, resending request")
-                        sock.sendto(f"GET {file_name} {offset} {chunk_id}".encode('utf-8'), (SERVER_HOST, SERVER_PORT))
-                elif data == b"FILE_NOT_FOUND":
-                    print(f"  File not found on server: {file_name}")
-                    event.set()
+            with self.lock:
+                # Check if download is complete
+                all_complete = all(
+                    self.active_downloads[filename].get(i, {}).get("complete", False)
+                    for i in range(total_chunks)
+                )
+                if all_complete:
                     break
+                
+                # Calculate overall progress
+                total_received = sum(
+                    self.active_downloads[filename].get(i, {}).get("received", 0)
+                    for i in range(total_chunks)
+                )
+                total_size = sum(
+                    self.active_downloads[filename].get(i, {}).get("total", 0)
+                    for i in range(total_chunks)
+                )
+                
+                if total_size > 0:
+                    overall_percent = (total_received / total_size) * 100
                 else:
-                    print(f"  Unexpected data: {data.decode('utf-8')}")
-            except socket.timeout:
-                print(f"  Timeout waiting for chunk {chunk_id}, resending request")
-                sock.sendto(f"GET {file_name} {offset} {chunk_id}".encode('utf-8'), (SERVER_HOST, SERVER_PORT))
-    except Exception as e:
-        print(f"  Error downloading chunk {chunk_id}: {e}")
-    finally:
-        sock.close()
-
-# Function to handle file download
-def download_file(file_name, file_size):
-    print(f"Starting download of {file_name} ({file_size})")
-    threads = []
-    total_size_bytes = int(file_size[:-2]) * 1024 * 1024
-    total_chunks = math.ceil(total_size_bytes / CHUNK_SIZE)
-    chunks_per_connection = math.ceil(total_chunks / NUM_CONNECTIONS)
-
-    for i in range(NUM_CONNECTIONS):
-        start_chunk = i * chunks_per_connection
-        end_chunk = min((i + 1) * chunks_per_connection, total_chunks)
-        for j in range(start_chunk, end_chunk):
-            offset = j * CHUNK_SIZE
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            event = threading.Event()
-            thread = threading.Thread(target=download_chunk, args=(file_name, offset, sock, str(j), total_chunks, event))
-            threads.append(thread)
-            thread.start()
-
-    for thread in threads:
-        thread.join()  # Wait for all threads to complete
-
-    print(f"Finished downloading {file_name}")
-    reassemble_file(file_name)
-
-# Function to reassemble the downloaded chunks
-def reassemble_file(file_name):
-    print(f"Reassembling {file_name}")
-    try:
-        with open(os.path.join(DOWNLOAD_DIR, file_name), 'wb') as f:
-            for offset in sorted(downloaded_chunks.get(file_name, {}).keys()):
-                f.write(downloaded_chunks[file_name][offset])
-        print(f"File {file_name} reassembled successfully.")
-        download_complete[file_name] = True
-    except Exception as e:
-        print(f"Error reassembling file: {e}")
-
-# Function to read input.txt and manage downloads
-def manage_downloads():
-    file_list = get_file_list()
-    print("Available files:")
-    for name, size in file_list:
-        print(f"- {name} ({size})")
-
-    try:
-        with open(INPUT_FILE, 'r') as f:
-            files_to_download = [line.strip() for line in f]
-    except FileNotFoundError:
-        print(f"Error: {INPUT_FILE} not found. Creating an empty one.")
-        open(INPUT_FILE, 'w').close()  # Create an empty file
-        files_to_download = []
-
-    files_downloaded = set()
-    while True:
-        try:
-            with open(INPUT_FILE, 'r') as f:
-                new_files_to_download = [line.strip() for line in f if line.strip() not in files_downloaded]
-        except FileNotFoundError:
-            new_files_to_download = []
+                    overall_percent = 0
             
-        for file_name in new_files_to_download:
-            file_info = next((f for f in file_list if f[0] == file_name), None)
-            if file_info:
-                download_file(file_info[0], file_info[1])
-                files_downloaded.add(file_name)
-            else:
-                print(f"File {file_name} not found on the server.")
+            # Only update display every 0.2 seconds to prevent flickering
+            if time.time() - last_update >= 0.2:
+                os.system('cls' if os.name == 'nt' else 'clear')
+                print(f"Downloading {filename} - Overall: {overall_percent:.1f}%")
+                
+                for i in range(total_chunks):
+                    chunk_data = self.active_downloads.get(filename, {}).get(i, {})
+                    chunk_received = chunk_data.get("received", 0)
+                    chunk_total = chunk_data.get("total", 1)
+                    chunk_percent = (chunk_received / chunk_total) * 100 if chunk_total > 0 else 0
+                    status = "✓" if chunk_data.get("complete", False) else "✗" if chunk_data.get("failed", False) else " "
+                    
+                    print(f"  Chunk {i+1}: [{status}] {chunk_percent:.1f}% ({chunk_received/1024:.1f}KB/{chunk_total/1024:.1f}KB)")
+                
+                last_update = time.time()
+            
+            time.sleep(0.1)
+
+    def check_new_files(self):
+        """Check input.txt for new files to download"""
+        current_files = set()
+        new_files = set()
         
-        # Display download progress
-        for file_name in downloaded_chunks:
-            if file_name not in download_complete:
-                total_size_bytes = int(next((f[1] for f in file_list if f[0] == file_name), '0MB')[:-2]) * 1024 * 1024
-                total_chunks = math.ceil(total_size_bytes / CHUNK_SIZE)
-                chunks_downloaded = len(downloaded_chunks[file_name])
-                progress = (chunks_downloaded / total_chunks) * 100
-                print(f"Downloading {file_name}: {progress:.2f}% complete")
+        # Read currently listed files
+        if os.path.exists(self.input_file):
+            with open(self.input_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        current_files.add(line)
         
-        time.sleep(5)  # Check for new files every 5 seconds
+        # Find new files not yet downloaded
+        for filename in current_files:
+            if filename not in self.downloaded_files:
+                new_files.add(filename)
         
-        if all(download_complete.values()):
-            print("All downloads complete.")
-            break
+        return new_files
+
+    def human_readable_size(self, size_bytes):
+        """Convert size in bytes to human-readable format (MB, GB)"""
+        if size_bytes >= 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+        elif size_bytes >= 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        elif size_bytes >= 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        else:
+            return f"{size_bytes} bytes"
+
+    def run(self):
+        """Main client loop"""
+        try:
+            # Get list of available files
+            available_files = self.get_file_list()
+            if not available_files:
+                print("No files available on server")
+                return
+            
+            print("Available files on server:")
+            for filename, size in available_files.items():
+                print(f"  {filename} - {self.human_readable_size(size)}")
+            
+            while True:
+                # Check for new files to download
+                new_files = self.check_new_files()
+                
+                for filename in new_files:
+                    if filename in available_files:
+                        print(f"\nStarting download of {filename}")
+                        self.download_file(filename, available_files[filename])
+                    else:
+                        print(f"\nFile not available on server: {filename}")
+                
+                time.sleep(5)  # Check for new files every 5 seconds
+                
+        except KeyboardInterrupt:
+            print("\nClient shutting down...")
+        except Exception as e:
+            print(f"Error: {e}")
 
 if __name__ == "__main__":
-    # Create a dummy input.txt and downloads directory
-    with open(INPUT_FILE, 'w') as f:
-        f.write("100MB.zip\n")  # Add some files to download
-    if not os.path.exists(DOWNLOAD_DIR):
-        os.makedirs(DOWNLOAD_DIR)
-    download_complete = {}
-
-    manage_downloads()
+    client = UDPClient()
+    client.run()
