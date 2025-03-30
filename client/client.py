@@ -51,64 +51,6 @@ class UDPClient:
         self.sock.sendto(json.dumps(ack).encode(), server_addr)
 
     def download_chunk(self, filename, chunk_id, offset, chunk_size):
-        """Download a specific chunk of a file"""
-        temp_filename = f"{filename}.part{chunk_id}"
-        received_packets = set()
-        
-        request = {
-            "type": "download",
-            "filename": filename,
-            "chunk_id": chunk_id,
-            "offset": offset,
-            "chunk_size": chunk_size
-        }
-        
-        self.sock.sendto(json.dumps(request).encode(), (self.server_ip, self.server_port))
-        
-        with open(temp_filename, 'wb') as f:
-            while True:
-                try:
-                    data, server_addr = self.sock.recvfrom(65536)  # Large buffer for file data
-                    packet = json.loads(data.decode())
-                    
-                    if packet.get("type") == "data":
-                        seq_num = packet.get("seq_num")
-                        if seq_num not in received_packets:
-                            # Write the data to file
-                            f.write(bytes.fromhex(packet.get("data")))
-                            received_packets.add(seq_num)
-                            
-                            # Update progress
-                            with self.lock:
-                                if filename in self.active_downloads and chunk_id in self.active_downloads[filename]:
-                                    self.active_downloads[filename][chunk_id]["received"] = len(received_packets)
-                                    self.active_downloads[filename][chunk_id]["total"] = packet.get("total_packets", 1)
-                            
-                            # Send ACK
-                            self.send_ack(filename, chunk_id, seq_num, server_addr)
-                    
-                    elif packet.get("type") == "end":
-                        # End of chunk received
-                        with self.lock:
-                            if filename in self.active_downloads and chunk_id in self.active_downloads[filename]:
-                                self.active_downloads[filename][chunk_id]["complete"] = True
-                        break
-                    
-                    elif packet.get("type") == "error":
-                        print(f"Error downloading {filename} chunk {chunk_id}: {packet.get('message')}")
-                        break
-                
-                except socket.timeout:
-                    print(f"Timeout while downloading {filename} chunk {chunk_id}")
-                    break
-                except json.JSONDecodeError:
-                    print("Invalid packet received")
-                    continue
-                except Exception as e:
-                    print(f"Error processing packet: {e}")
-                    break
-
-    def download_chunk(self, filename, chunk_id, offset, chunk_size):
         """Download a specific chunk of a file with progress tracking"""
         temp_filename = f"{filename}.part{chunk_id}"
         received_bytes = 0
