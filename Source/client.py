@@ -7,6 +7,9 @@ import signal
 import sys
 import hashlib
 import base64
+
+CHUNK_SIZE = 1024
+RECEIVE_SIZE = CHUNK_SIZE * 16
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -65,24 +68,24 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
     }
     sock.sendto(json.dumps(request).encode("utf-8"), server_address)
     
-    # Wait for the server to respond with ACK for the download request
-    while True:
-        try:
-            sock.settimeout(5)
-            data, _ = sock.recvfrom(1024)
-            while not data:
-                data, _ = sock.recvfrom(1024)
-            packet = parse_response(data)
-            print(f"Received packet for ACK download: {packet}")
-            if packet and packet['type'] == FileTransferProtocol.ACK:
-                print(f"Received ACK for {file_name} part {part_num}")
-                break
-            else:
-                print(f"Unexpected packet type: {packet['type']}")
-        except socket.timeout:
-            print(f"Timeout while waiting for ACK for {file_name} part {part_num}")
-            # Resend the request if no ACK received
-            sock.sendto(json.dumps(request).encode("utf-8"), server_address)
+    # # Wait for the server to respond with ACK for the download request
+    # while True:
+    #     try:
+    #         sock.settimeout(5)
+    #         data, _ = sock.recvfrom(1024)
+    #         while not data:
+    #             data, _ = sock.recvfrom(1024)
+    #         packet = parse_response(data)
+    #         # print(f"Received packet for ACK download: {packet}")
+    #         if packet and packet['type'] == FileTransferProtocol.ACK:
+    #             print(f"Received ACK for {file_name} part {part_num}")
+    #             break
+    #         else:
+    #             print(f"Unexpected packet type: {packet['type']}")
+    #     except socket.timeout:
+    #         print(f"Timeout while waiting for ACK for {file_name} part {part_num}")
+    #         # Resend the request if no ACK received
+    #         sock.sendto(json.dumps(request).encode("utf-8"), server_address)
 
     
     # Initialize storage for received data
@@ -90,53 +93,58 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
     total_chunks = -1
     file_metadata = None
 
-    # Wait for the server to respond to the download request
-    # Wait for START packet
-    while True:
-        try:
-            sock.settimeout(5)
-            data, _ = sock.recvfrom(1024)
-            while not data:
-                data, _ = sock.recvfrom(1024)
-            packet = parse_response(data)
-            print(f"Received packet: {packet}")
-            if packet and packet['type'] == FileTransferProtocol.START_CHUNK:
-                total_chunks = packet.get('total_chunks', -1)
-                file_metadata = packet
-                print(f"Received START packet for {file_name} part {part_num}")
-                # Send ACK for START packet
-                ack_packet = json.dumps({
-                    'type': FileTransferProtocol.ACK,
-                    'sequence': 0,
-                    'offset': offset,
-                }).encode()
-                sock.sendto(ack_packet, server_address)
-                break
-            else:
-                sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-        except socket.timeout:
-            print(f"Timeout while waiting for START packet for {file_name} part {part_num}")
+    # # Wait for START packet
+    # while True:
+    #     try:
+    #         sock.settimeout(5)
+    #         data, _ = sock.recvfrom(1024)
+    #         while not data:
+    #             data, _ = sock.recvfrom(1024)
+    #         packet = parse_response(data)
+    #         print(f"Received packet: {packet}")
+    #         if packet and packet['type'] == FileTransferProtocol.START_CHUNK:
+    #             total_chunks = packet.get('total_chunks', -1)
+    #             file_metadata = packet
+    #             print(f"Received START packet for {file_name} part {part_num}")
+    #             # Send ACK for START packet
+    #             ack_packet = json.dumps({
+    #                 'type': FileTransferProtocol.ACK,
+    #                 'sequence': 0,
+    #                 'offset': offset,
+    #             }).encode()
+    #             sock.sendto(ack_packet, server_address)
+    #             break
+    #         else:
+    #             sock.sendto(json.dumps(request).encode("utf-8"), server_address)
+    #     except socket.timeout:
+    #         print(f"Timeout while waiting for START packet for {file_name} part {part_num}")
 
 
     while True:
         try:
             sock.settimeout(10)  # 10-second timeout
             # if receive nothing, receive again
-            rawdata, _ = sock.recvfrom(1024*3)
+            rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
             while not rawdata:
-                rawdata, _ = sock.recvfrom(1024*3)
-            print(rawdata.decode())
-            # rawdata have encoded data field
-            # Decode and parse the packet
+                rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
+            # print(rawdata.decode())
             packet = json.loads(rawdata.decode())
 
             # Handle different packet types
-            # if packet['type'] == FileTransferProtocol.START_CHUNK:
-            #     total_chunks = packet.get('total_chunks', -1)
-            #     file_metadata = packet
-            #     continue
+            if packet['type'] == FileTransferProtocol.START_CHUNK:
+                total_chunks = packet.get('total_chunks', -1)
+                file_metadata = packet
+                print(f"Received START packet for {file_name} part {part_num}")
+                # Send ACK for START packet
+                ack_packet = json.dumps({
+                    'type': FileTransferProtocol.ACK,
+                    'file_name': file_name,
+                    'sequence': 0,
+                    'offset': offset,
+                }).encode()
+                sock.sendto(ack_packet, server_address)
 
-            if packet['type'] == FileTransferProtocol.DATA_CHUNK:
+            elif packet['type'] == FileTransferProtocol.DATA_CHUNK:
                 # Verify checksum
                 # chunk_data = packet['data'].encode('latin-1')
                 chunk_data = base64.b64decode(packet['data'])
@@ -146,7 +154,9 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                     # ACK the chunk
                     ack_packet = json.dumps({
                         'type': FileTransferProtocol.ACK,
-                        'sequence': packet['sequence']
+                        'sequence': packet['sequence'],
+                        'file_name': file_name,
+                        'offset': offset
                     }).encode()
                     sock.sendto(ack_packet, server_address)
                     
@@ -160,7 +170,9 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                     # Send NACK if checksum fails
                     nack_packet = json.dumps({
                         'type': FileTransferProtocol.NACK,
-                        'sequence': packet['sequence']
+                        'sequence': packet['sequence'],
+                        'file_name': file_name,
+                        'offset': offset
                     }).encode()
                     sock.sendto(nack_packet, server_address)
 
@@ -170,7 +182,6 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
 
         except socket.timeout:
             print(f"Timeout while downloading {file_name} part {part_num}")
-            break
 
     # Reconstruct and write file
     if total_chunks > 0 and len(received_data) == total_chunks:

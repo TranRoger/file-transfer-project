@@ -4,6 +4,8 @@ import hashlib
 import time
 import base64
 import threading
+
+CHUNK_SIZE = 1024
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -60,8 +62,6 @@ def send_end_packet(sock, client_addr, file_name):
     )
     sock.sendto(end_packet, client_addr)
 
-def pack_and_send_data(sock, client_addr, file_name, data, sequence):
-    return None
 
 def send_file_chunk(sock, client_addr, file_name, offset, length):
     """Send a file chunk using enhanced UDP protocol."""
@@ -71,7 +71,7 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
             data = f.read(length)
             
             # Calculate total chunks and chunk size
-            chunk_size = 1024  # 1 KB
+            chunk_size = CHUNK_SIZE
             total_chunks = (len(data) + chunk_size - 1) // chunk_size
             
             # continue sending start packet until ACK for start packet is received
@@ -81,12 +81,10 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
             while True:
                 # Wait for ACK with timeout
                 try:
-                    sock.settimeout(2)  # 2-second timeout
-                    response, _ = sock.recvfrom(1024)
-                    while not response:
-                        response, _ = sock.recvfrom(1024)
+                    sock.settimeout(1)  # 2-second timeout
+                    response, _ = sock.recvfrom(1024*4)
                     parsed = parse_packet(response)
-                    print(f"Received packet: {parsed}")
+                    # print(f"Received packet: {parsed}")
                     
                     # If ACK received, break the loop
                     if parsed['type'] == FileTransferProtocol.ACK and parsed['file_name'] == file_name and parsed['sequence'] == 0 and parsed['offset'] == offset:
@@ -115,16 +113,15 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                 # packet_sent = json.loads(data_packet.decode())
                 # print(f"Sending chunk {seq} with checksum {packet_sent['data']}")
                 sock.sendto(data_packet, client_addr)
-                # sleep for 0.1 seconds to simulate network delay
-                time.sleep(0.1)
+                
+                # time.sleep(0.05)
+
                 # Wait for ACK with timeout
                 try:
                     sock.settimeout(2)  # 2-second timeout
-                    # do while loop until ACK or NACK received
-                    # if json is blank, receive again
-                    response, _ = sock.recvfrom(1024*2)
+                    response, _ = sock.recvfrom(1024*4)
                     while not response:
-                        response, _ = sock.recvfrom(1024*2)
+                        response, _ = sock.recvfrom(1024*4)
                     parsed = parse_packet(response)
                     
                     # If NACK received, resend chunk
@@ -147,9 +144,9 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                 # Wait for ACK with timeout
                 try:
                     sock.settimeout(2)  # 2-second timeout
-                    response, _ = sock.recvfrom(1024)
+                    response, _ = sock.recvfrom(1024*4)
                     while not response:
-                        response, _ = sock.recvfrom(1024)
+                        response, _ = sock.recvfrom(1024*4)
                     parsed = parse_packet(response)
                     
                     # If ACK received, break the loop
@@ -229,7 +226,11 @@ def main():
     print("UDP Server listening on port 12345...")
 
     while True:
-        data, client_addr = server.recvfrom(1024)
+        # no timeout, wait for incoming packets
+        # set receive window size to half of chunk size, change to integer
+        
+        receive_window = CHUNK_SIZE // 2
+        data, client_addr = server.recvfrom(receive_window)
 
         # Parse the packet type
         parsed = parse_packet(data)
@@ -239,29 +240,6 @@ def main():
         else:
             client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
             client_thread.start()
-
-
-# def main():
-#     """Start the UDP server and handle file transfer requests."""
-#     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-#     server.bind(("10.250.91.1", 12345))
-#     print("UDP Server listening on port 12345...")
-
-#     while True:
-#         # Receive request
-#         data, client_addr = server.recvfrom(1024)
-#         print(f"Received request from {client_addr}: {data.decode(errors='ignore')}")
-#         parsed = parse_packet(data)
-#         print(f"Parsed request: {parsed}")
-
-#         if parsed["type"] == "LIST":
-#             # Send list of available files
-#             with open("files.txt", "r") as f:
-#                 files_list = f.read()
-#             server.sendto(files_list.encode(), client_addr)
-        
-#         elif parsed["type"] == "DOWNLOAD":
-#             send_file_chunk(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"])
 
 if __name__ == "__main__":
     main()
