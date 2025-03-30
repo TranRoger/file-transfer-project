@@ -93,33 +93,6 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
     total_chunks = -1
     file_metadata = None
 
-    # # Wait for START packet
-    # while True:
-    #     try:
-    #         sock.settimeout(5)
-    #         data, _ = sock.recvfrom(1024)
-    #         while not data:
-    #             data, _ = sock.recvfrom(1024)
-    #         packet = parse_response(data)
-    #         print(f"Received packet: {packet}")
-    #         if packet and packet['type'] == FileTransferProtocol.START_CHUNK:
-    #             total_chunks = packet.get('total_chunks', -1)
-    #             file_metadata = packet
-    #             print(f"Received START packet for {file_name} part {part_num}")
-    #             # Send ACK for START packet
-    #             ack_packet = json.dumps({
-    #                 'type': FileTransferProtocol.ACK,
-    #                 'sequence': 0,
-    #                 'offset': offset,
-    #             }).encode()
-    #             sock.sendto(ack_packet, server_address)
-    #             break
-    #         else:
-    #             sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-    #     except socket.timeout:
-    #         print(f"Timeout while waiting for START packet for {file_name} part {part_num}")
-
-
     while True:
         try:
             sock.settimeout(10)  # 10-second timeout

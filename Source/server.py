@@ -15,6 +15,7 @@ class FileTransferProtocol:
     ACK = 'ACK'
     NACK = 'NACK'
     PROTO_CONST = [START_CHUNK, DATA_CHUNK, END_CHUNK, ACK, NACK]
+    REQUEST_CONST = ['LIST', 'DOWNLOAD']
 
     @staticmethod
     def create_packet(packet_type, file_name, sequence, data=None, total_chunks=None, checksum=None):
@@ -118,10 +119,10 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
 
                 # Wait for ACK with timeout
                 try:
-                    sock.settimeout(2)  # 2-second timeout
-                    response, _ = sock.recvfrom(1024*4)
+                    sock.settimeout(1)  # 2-second timeout
+                    response, _ = sock.recvfrom(CHUNK_SIZE)
                     while not response:
-                        response, _ = sock.recvfrom(1024*4)
+                        response, _ = sock.recvfrom(CHUNK_SIZE)
                     parsed = parse_packet(response)
                     
                     # If NACK received, resend chunk
@@ -143,10 +144,10 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
             while True:
                 # Wait for ACK with timeout
                 try:
-                    sock.settimeout(2)  # 2-second timeout
-                    response, _ = sock.recvfrom(1024*4)
+                    sock.settimeout(1)  # 2-second timeout
+                    response, _ = sock.recvfrom(CHUNK_SIZE)
                     while not response:
-                        response, _ = sock.recvfrom(1024*4)
+                        response, _ = sock.recvfrom(CHUNK_SIZE)
                     parsed = parse_packet(response)
                     
                     # If ACK received, break the loop
@@ -184,7 +185,7 @@ def parse_packet(response):
         return None, None, None
 
 # Store ongoing file transfers (key = client address, value = thread)
-active_transfers = {}
+active_transfers = []
 lock = threading.Lock()  # To safely modify active_transfers
 
 def handle_client(server, client_addr, data):
@@ -200,11 +201,14 @@ def handle_client(server, client_addr, data):
 
     elif parsed["type"] == "DOWNLOAD":
         # Start a thread for file transfer
+        transfer_thread = threading.Thread(target=send_file_chunk, args=(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"]))
         with lock:
-            if client_addr not in active_transfers:  # Prevent duplicate threads
-                transfer_thread = threading.Thread(target=send_file_chunk, args=(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"]))
-                active_transfers[client_addr] = transfer_thread
-                transfer_thread.start()
+            active_transfers.append(transfer_thread)
+        transfer_thread.start()
+        transfer_thread.join()  # Wait for the thread to finish
+        
+        with lock:
+            active_transfers.remove(transfer_thread)
 
 def handle_ack_nack(server, client_addr, data):
     """Process ACK/NACK packets and direct them to the correct file transfer thread."""
@@ -226,9 +230,12 @@ def main():
     print("UDP Server listening on port 12345...")
 
     while True:
-        # no timeout, wait for incoming packets
-        # set receive window size to half of chunk size, change to integer
-        
+        # Ensure only 4 threads are active at a time and wait for all to finish
+        while len(active_transfers) >= 4:
+            for thread in active_transfers:
+                thread.join()
+            active_transfers.clear()
+
         receive_window = CHUNK_SIZE // 2
         data, client_addr = server.recvfrom(receive_window)
 
@@ -237,8 +244,11 @@ def main():
 
         if parsed["type"] in FileTransferProtocol.PROTO_CONST:
             handle_ack_nack(server, client_addr, data)  # Handle ACK/NACK within existing transfer
-        else:
+        elif parsed["type"] in FileTransferProtocol.REQUEST_CONST:
             client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
+            with lock:
+                # Ensure the thread is added to active transfers
+                active_transfers.append(client_thread)
             client_thread.start()
 
 if __name__ == "__main__":
