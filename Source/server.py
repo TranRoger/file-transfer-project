@@ -1,14 +1,16 @@
 import socket
 import json
 import hashlib
-import time
 import base64
 import threading
+import queue
+import time
 
-CHUNK_SIZE = 1024*2
+CHUNK_SIZE = 1024 * 2
+NUM_WORKERS = 4  # Worker threads count
+
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
-    # Protocol constants
     START_CHUNK = 'START'
     DATA_CHUNK = 'DATA'
     END_CHUNK = 'END'
@@ -25,215 +27,189 @@ class FileTransferProtocol:
             'file_name': file_name,
             'sequence': sequence
         }
-        
+
         if data is not None:
-            # packet['data'] = data.decode() if isinstance(data, bytes) else data
             packet['data'] = base64.b64encode(data).decode("utf-8")
-        
+
         if total_chunks is not None:
             packet['total_chunks'] = total_chunks
-        
+
         if checksum is not None:
             packet['checksum'] = checksum
-        
+
         return json.dumps(packet).encode()
 
     @staticmethod
     def verify_checksum(data, expected_checksum):
         """Verify data integrity using MD5 checksum."""
-        current_checksum = hashlib.md5(data).hexdigest()
-        return current_checksum == expected_checksum
-    
-def send_start_packet(sock, client_addr, file_name, total_chunks):
-    """Send the start packet to the client."""
-    start_packet = FileTransferProtocol.create_packet(
-        FileTransferProtocol.START_CHUNK, 
-        file_name, 
-        sequence=0, 
-        total_chunks=total_chunks
-    )
-    sock.sendto(start_packet, client_addr)
-
-def send_end_packet(sock, client_addr, file_name):
-    """Send the end packet to the client."""
-    end_packet = FileTransferProtocol.create_packet(
-        FileTransferProtocol.END_CHUNK, 
-        file_name, 
-        0
-    )
-    sock.sendto(end_packet, client_addr)
+        return hashlib.md5(data).hexdigest() == expected_checksum
 
 
-def send_file_chunk(sock, client_addr, file_name, offset, length):
-    """Send a file chunk using enhanced UDP protocol."""
-    try:
-        with open(file_name, "rb") as f:
-            f.seek(offset)
-            data = f.read(length)
-            
-            # Calculate total chunks and chunk size
-            chunk_size = CHUNK_SIZE
-            total_chunks = (len(data) + chunk_size - 1) // chunk_size
-            
-            # Send START packet
-            # wait for ACK
-            send_start_packet(sock, client_addr, file_name, total_chunks)
-            while True:
-                # Wait for ACK with timeout
-                try:
-                    sock.settimeout(1)  # 2-second timeout
-                    response, _ = sock.recvfrom(1024*4)
-                    parsed = parse_packet(response)
-                    
-                    # If ACK received, break the loop
-                    if parsed['type'] == FileTransferProtocol.ACK and parsed['file_name'] == file_name and parsed['sequence'] == 0 and parsed['offset'] == offset:
-                        break
-                except socket.timeout:
-                    # Timeout - resend START packet
-                    print("Timeout - resending START packet")
-                    send_start_packet(sock, client_addr, file_name, total_chunks)
-            
-            
-            # Send data chunks
-            for seq in range(total_chunks):
-                chunk = data[seq*chunk_size : (seq+1)*chunk_size]
+class UDPServer:
+    """Optimized UDP File Server with worker threads and efficient request handling."""
 
-                # Calculate checksum for this chunk
-                checksum = hashlib.md5(chunk).hexdigest()
-                
-                # Create and send data packet
-                data_packet = FileTransferProtocol.create_packet(
-                    FileTransferProtocol.DATA_CHUNK, 
-                    file_name, 
-                    seq,
-                    checksum=checksum,
-                    data=chunk
-                )
-                sock.sendto(data_packet, client_addr)
-                
-                # time.sleep(0.05)
+    def __init__(self, ip="0.0.0.0", port=12345):
+        self.server_addr = (ip, port)
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.server_socket.bind(self.server_addr)
 
-                # Wait for ACK with timeout
-                try:
-                    sock.settimeout(1)  # 2-second timeout
-                    response, _ = sock.recvfrom(CHUNK_SIZE)
-                    while not response:
-                        response, _ = sock.recvfrom(CHUNK_SIZE)
-                    parsed = parse_packet(response)
-                    
-                    # If NACK received, resend chunk
-                    if parsed["type"] == FileTransferProtocol.NACK :
-                        # Resend the chunk immediately
-                        sock.sendto(data_packet, client_addr)
-                except socket.timeout:
-                    # Timeout - resend chunk
-                    sock.sendto(data_packet, client_addr)
-            
-            send_end_packet(sock, client_addr, file_name)
-            while True:
-                # Wait for ACK with timeout
-                try:
-                    sock.settimeout(1)  # 2-second timeout
-                    response, _ = sock.recvfrom(CHUNK_SIZE)
-                    while not response:
-                        response, _ = sock.recvfrom(CHUNK_SIZE)
-                    parsed = parse_packet(response)
-                    
-                    # If ACK received, break the loop
-                    if parsed["type"] == FileTransferProtocol.ACK:
-                        break
-                except socket.timeout:
-                    # Timeout - resend END packet
-                    send_end_packet(sock, client_addr, file_name)
-            
-    
-    except FileNotFoundError:
-        error_packet = FileTransferProtocol.create_packet(
-            'ERROR', 
-            file_name, 
-            0, 
-            data=f"File {file_name} not found"
-        )
-        sock.sendto(error_packet, client_addr)
+        self.packet_queue = queue.Queue()  # Packet queue for processing
+        self.active_transfers = {}  # Track active file transfers
+        self.lock = threading.Lock()
 
-def parse_packet(response):
-    """Parse the incoming response from the client."""
-    # expecting json format
-    try:
-        response_data = json.loads(response.decode())
-        # Extract relevant fields
-        response_data["type"] = response_data.get('type')
-        response_data["file_name"] = response_data.get('file_name')
-        response_data["offset"] = response_data.get('offset', 0)
-        response_data["length"] = response_data.get('length', 1024)
-        response_data["sequence"] = response_data.get('sequence', 0)
-        # return type, file_name, offset, length, sequence
-        return response_data
-    except json.JSONDecodeError:
-        print("Invalid response format")
-        return None, None, None
+        self.worker_threads = []
+        self.running = True
 
-active_transfers = []
-lock = threading.Lock()  # To safely modify active_transfers
+    def start(self):
+        """Start server with receiver and worker threads."""
+        print(f"UDP Server started on {self.server_addr}")
 
-def handle_client(server, client_addr, data):
-    """Handle client requests for LIST and DOWNLOAD."""
-    parsed = parse_packet(data)
-    print(f"Received request from {client_addr}: {parsed}")
+        receiver_thread = threading.Thread(target=self.receive_packets, daemon=True)
+        receiver_thread.start()
 
-    if parsed["type"] == "LIST":
-        # Send list of available files
-        with open("files.txt", "r") as f:
-            files_list = f.read()
-        server.sendto(files_list.encode(), client_addr)
+        for _ in range(NUM_WORKERS):
+            worker = threading.Thread(target=self.worker_process, daemon=True)
+            worker.start()
+            self.worker_threads.append(worker)
 
-    elif parsed["type"] == "DOWNLOAD":
-        # Start a thread for file transfer
-        transfer_thread = threading.Thread(target=send_file_chunk, args=(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"]))
-        with lock:
-            active_transfers.append(transfer_thread)
-        transfer_thread.start()
-        transfer_thread.join()  # Wait for the thread to finish
-        
-        with lock:
-            active_transfers.remove(transfer_thread)
+        receiver_thread.join()
 
-def handle_ack_nack(server, client_addr, data):
-    """Process ACK/NACK packets and direct them to the correct file transfer thread."""
-    parsed = parse_packet(data)
-    print(f"Received ACK/NACK from {client_addr}: {parsed}")
+    def receive_packets(self):
+        """Main receiver thread that listens for incoming packets."""
+        while self.running:
+            try:
+                data, client_addr = self.server_socket.recvfrom(CHUNK_SIZE)
+                self.packet_queue.put((data, client_addr))  # Enqueue packet for workers
+            except socket.error as e:
+                print(f"Socket error: {e}")
 
-    with lock:
-        if client_addr in active_transfers:
-            transfer_thread = active_transfers[client_addr]
-            if transfer_thread.is_alive():
-                # Notify the transfer thread (e.g., using a queue or shared variable)
-                print(f"Notifying transfer thread of ACK/NACK for {client_addr}")
-                # You can implement a queue-based approach here for better control.
+    def worker_process(self):
+        """Worker threads process client requests."""
+        while self.running:
+            try:
+                data, client_addr = self.packet_queue.get(timeout=1)
+                parsed = self.parse_packet(data)
 
-def main():
-    """Start the UDP server."""
-    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server.bind(("10.250.91.1", 12345))
-    print("UDP Server listening on port 12345...")
+                if parsed["type"] in FileTransferProtocol.PROTO_CONST:
+                    self.handle_ack_nack(client_addr, parsed)
+                else:
+                    self.handle_client_request(client_addr, parsed)
 
-    while True:
+            except queue.Empty:
+                continue  # No packet to process
+
+    def parse_packet(self, data):
+        """Parse incoming packet."""
         try:
-            receive_window = CHUNK_SIZE // 4
-            data, client_addr = server.recvfrom(receive_window)
+            return json.loads(data.decode())
+        except json.JSONDecodeError:
+            print("Invalid packet format")
+            return {}
 
-            # Parse the packet type
-            parsed = parse_packet(data)
+    def handle_client_request(self, client_addr, parsed):
+        """Process client LIST and DOWNLOAD requests."""
+        print(f"Received request from {client_addr}: {parsed}")
 
-            if parsed["type"] in FileTransferProtocol.PROTO_CONST:
-                handle_ack_nack(server, client_addr, data)  # Handle ACK/NACK within existing transfer
-            else:
-                client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
-                client_thread.start()
+        if parsed["type"] == "LIST":
+            self.send_file_list(client_addr)
+
+        elif parsed["type"] == "DOWNLOAD":
+            transfer_thread = threading.Thread(target=self.send_file_chunk,
+                                               args=(client_addr, parsed["file_name"],
+                                                     parsed["offset"], parsed["length"]),
+                                               daemon=True)
+            with self.lock:
+                self.active_transfers[client_addr] = transfer_thread
+
+            transfer_thread.start()
+
+    def handle_ack_nack(self, client_addr, parsed):
+        """Process ACK/NACK packets."""
+        with self.lock:
+            if client_addr in self.active_transfers:
+                transfer_thread = self.active_transfers[client_addr]
+                if transfer_thread.is_alive():
+                    print(f"Notifying transfer thread of ACK/NACK for {client_addr}")
+
+    def send_file_list(self, client_addr):
+        """Send list of available files."""
+        # files = {"example.txt": "5MB", "large_video.mp4": "500MB"}
+        with open("files.txt", "r") as f:
+            files = f.read()
+        self.server_socket.sendto(files.encode(), client_addr)
+
+    def send_file_chunk(self, client_addr, file_name, offset, length):
+        """Send a file chunk with improved efficiency."""
+        try:
+            with open(file_name, "rb") as f:
+                f.seek(offset)
+                data = f.read(length)
+
+                total_chunks = (len(data) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+                # Send START packet
+                self.send_start_packet(client_addr, file_name, total_chunks)
+
+                for seq in range(total_chunks):
+                    chunk = data[seq * CHUNK_SIZE: (seq + 1) * CHUNK_SIZE]
+                    checksum = hashlib.md5(chunk).hexdigest()
+
+                    data_packet = FileTransferProtocol.create_packet(
+                        FileTransferProtocol.DATA_CHUNK,
+                        file_name,
+                        seq,
+                        checksum=checksum,
+                        data=chunk
+                    )
+                    self.server_socket.sendto(data_packet, client_addr)
+
+                    # Wait for ACK/NACK with timeout
+                    self.wait_for_ack(client_addr, file_name, seq)
+
+                # Send END packet
+                self.send_end_packet(client_addr, file_name)
+
+        except FileNotFoundError:
+            error_packet = FileTransferProtocol.create_packet(
+                'ERROR', file_name, 0, data=f"File {file_name} not found"
+            )
+            self.server_socket.sendto(error_packet, client_addr)
+
+    def wait_for_ack(self, client_addr, file_name, seq):
+        """Wait for ACK and handle retransmissions."""
+        try:
+            self.server_socket.settimeout(1)
+            response, _ = self.server_socket.recvfrom(CHUNK_SIZE)
+            parsed = self.parse_packet(response)
+
+            if parsed["type"] == FileTransferProtocol.NACK:
+                print(f"Resending chunk {seq} for {client_addr}")
+                self.send_file_chunk(client_addr, file_name, seq * CHUNK_SIZE, CHUNK_SIZE)
+
         except socket.timeout:
-            print("Timeout occurred, retrying...")
-            time.sleep(10)
-            continue  # Prevent termination due to TimeoutError
+            print(f"Timeout on chunk {seq}, resending")
+            self.send_file_chunk(client_addr, file_name, seq * CHUNK_SIZE, CHUNK_SIZE)
+
+    def send_start_packet(self, client_addr, file_name, total_chunks):
+        """Send the start packet to the client."""
+        start_packet = FileTransferProtocol.create_packet(
+            FileTransferProtocol.START_CHUNK,
+            file_name,
+            sequence=0,
+            total_chunks=total_chunks
+        )
+        self.server_socket.sendto(start_packet, client_addr)
+
+    def send_end_packet(self, client_addr, file_name):
+        """Send the end packet to the client."""
+        end_packet = FileTransferProtocol.create_packet(
+            FileTransferProtocol.END_CHUNK,
+            file_name,
+            sequence=0
+        )
+        self.server_socket.sendto(end_packet, client_addr)
+
 
 if __name__ == "__main__":
-    main()
+    server = UDPServer(ip="0.0.0.0", port=12345)
+    server.start()

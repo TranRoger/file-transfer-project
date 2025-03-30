@@ -32,8 +32,10 @@ def get_file_list(sock):
     request = json.dumps({'type': 'LIST'}).encode()
     sock.sendto(request, server_address)
     data, _ = sock.recvfrom(1024)
+    print("Received file list from server:: ", data.decode())
     files = {}
     for line in data.decode().splitlines():
+        print("Line: ", line)
         if line:
             name, size_str = line.split()
             if size_str.endswith("MB"):
@@ -58,7 +60,6 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
     port = 20000 + socket_id
     sock.bind(("0.0.0.0", port))
 
-    # Send download request as JSON format
     request = {
         'type': "DOWNLOAD",
         'file_name': file_name,
@@ -67,28 +68,27 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
         'socket_id': socket_id,
     }
     sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-    
-    # Initialize storage for received data
+
     received_data = {}
     total_chunks = -1
-    file_metadata = None
+    timeout_count = 0
+    MAX_TIMEOUTS = 5  # Prevent endless retrying
 
-    while True:
+    while timeout_count < MAX_TIMEOUTS:
         try:
-            sock.settimeout(10)  # 10-second timeout
-            # if receive nothing, receive again
+            sock.settimeout(10)
             rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
-            while not rawdata:
-                rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
-            # print(rawdata.decode())
-            packet = json.loads(rawdata.decode())
 
-            # Handle different packet types
+            if not rawdata:
+                timeout_count += 1
+                continue  # Retry receiving
+            
+            packet = json.loads(rawdata.decode())
+            timeout_count = 0  # Reset timeout count on valid response
+
             if packet['type'] == FileTransferProtocol.START_CHUNK:
                 total_chunks = packet.get('total_chunks', -1)
-                file_metadata = packet
                 print(f"Received START packet for {file_name} part {part_num}")
-                # Send ACK for START packet
                 ack_packet = json.dumps({
                     'type': FileTransferProtocol.ACK,
                     'file_name': file_name,
@@ -98,13 +98,10 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                 sock.sendto(ack_packet, server_address)
 
             elif packet['type'] == FileTransferProtocol.DATA_CHUNK:
-                # Verify checksum
-                # chunk_data = packet['data'].encode('latin-1')
                 chunk_data = base64.b64decode(packet['data'])
                 checksum = packet['checksum']
                 
                 if FileTransferProtocol.verify_checksum(chunk_data, checksum):
-                    # ACK the chunk
                     ack_packet = json.dumps({
                         'type': FileTransferProtocol.ACK,
                         'sequence': packet['sequence'],
@@ -112,15 +109,11 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                         'offset': offset
                     }).encode()
                     sock.sendto(ack_packet, server_address)
-                    
-                    # Store the chunk
+
                     received_data[packet['sequence']] = chunk_data
-                    
-                    # Update progress
                     with progress_lock:
                         progress[part_num] = (len(received_data) * 1024, length)
                 else:
-                    # Send NACK if checksum fails
                     nack_packet = json.dumps({
                         'type': FileTransferProtocol.NACK,
                         'sequence': packet['sequence'],
@@ -130,17 +123,16 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                     sock.sendto(nack_packet, server_address)
 
             elif packet['type'] == FileTransferProtocol.END_CHUNK:
-                # Final chunk received, break the loop
                 break
 
         except socket.timeout:
-            print(f"Timeout while downloading {file_name} part {part_num}")
+            timeout_count += 1
+            print(f"Timeout ({timeout_count}/{MAX_TIMEOUTS}) while downloading {file_name} part {part_num}")
 
-    # Reconstruct and write file
+    sock.close()  # Close socket when done
+
     if total_chunks > 0 and len(received_data) == total_chunks:
-        # Reconstruct file data
         file_data = b''.join(received_data[i] for i in range(total_chunks))
-        
         with open(output_file, "r+b") as f:
             f.seek(offset)
             f.write(file_data[:length])
