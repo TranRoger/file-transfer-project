@@ -8,7 +8,7 @@ import time
 import uuid
 
 # Global variables
-MULTIPLIER = 16
+MULTIPLIER = 8
 CHUNK_SIZE = 1024 * MULTIPLIER  # Bytes
 lock = threading.Lock()  # To ensure thread safety
 client_queues = {}  # Dictionary of queues for each client

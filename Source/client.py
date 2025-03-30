@@ -10,7 +10,7 @@ import base64
 import queue
 
 # Configuration
-MULTIPLIER = 16
+MULTIPLIER = 8
 CHUNK_SIZE = 1024 * MULTIPLIER
 RECEIVE_SIZE = CHUNK_SIZE * 8
 MAX_TIMEOUTS = 5
@@ -280,7 +280,7 @@ def download_part(file_name, offset, length, output_file, part_num, progress):
     sock.sendto(request_packet, server_address)
     
     # Wait for completion or timeout
-    max_wait_time = 60 * 5  # 5 minutes timeout for whole part
+    max_wait_time = 60 * 2  # 5 minutes timeout for whole part
     wait_start = time.time()
     
     while not completion_event.is_set() and time.time() - wait_start < max_wait_time:
