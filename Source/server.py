@@ -5,7 +5,7 @@ import time
 import base64
 import threading
 
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 1024*2
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -75,7 +75,6 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
             chunk_size = CHUNK_SIZE
             total_chunks = (len(data) + chunk_size - 1) // chunk_size
             
-            # continue sending start packet until ACK for start packet is received
             # Send START packet
             # wait for ACK
             send_start_packet(sock, client_addr, file_name, total_chunks)
@@ -85,7 +84,6 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                     sock.settimeout(1)  # 2-second timeout
                     response, _ = sock.recvfrom(1024*4)
                     parsed = parse_packet(response)
-                    # print(f"Received packet: {parsed}")
                     
                     # If ACK received, break the loop
                     if parsed['type'] == FileTransferProtocol.ACK and parsed['file_name'] == file_name and parsed['sequence'] == 0 and parsed['offset'] == offset:
@@ -111,8 +109,6 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                     checksum=checksum,
                     data=chunk
                 )
-                # packet_sent = json.loads(data_packet.decode())
-                # print(f"Sending chunk {seq} with checksum {packet_sent['data']}")
                 sock.sendto(data_packet, client_addr)
                 
                 # time.sleep(0.05)
@@ -133,13 +129,6 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                     # Timeout - resend chunk
                     sock.sendto(data_packet, client_addr)
             
-            # Send END packet
-            # end_packet = FileTransferProtocol.create_packet(
-            #     FileTransferProtocol.END_CHUNK, 
-            #     file_name, 
-            #     total_chunks
-            # )
-            # sock.sendto(end_packet, client_addr)
             send_end_packet(sock, client_addr, file_name)
             while True:
                 # Wait for ACK with timeout
@@ -184,7 +173,6 @@ def parse_packet(response):
         print("Invalid response format")
         return None, None, None
 
-# Store ongoing file transfers (key = client address, value = thread)
 active_transfers = []
 lock = threading.Lock()  # To safely modify active_transfers
 
@@ -230,26 +218,22 @@ def main():
     print("UDP Server listening on port 12345...")
 
     while True:
-        # Ensure only 4 threads are active at a time and wait for all to finish
-        while len(active_transfers) >= 4:
-            for thread in active_transfers:
-                thread.join()
-            active_transfers.clear()
+        try:
+            receive_window = CHUNK_SIZE // 4
+            data, client_addr = server.recvfrom(receive_window)
 
-        receive_window = CHUNK_SIZE // 2
-        data, client_addr = server.recvfrom(receive_window)
+            # Parse the packet type
+            parsed = parse_packet(data)
 
-        # Parse the packet type
-        parsed = parse_packet(data)
-
-        if parsed["type"] in FileTransferProtocol.PROTO_CONST:
-            handle_ack_nack(server, client_addr, data)  # Handle ACK/NACK within existing transfer
-        elif parsed["type"] in FileTransferProtocol.REQUEST_CONST:
-            client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
-            with lock:
-                # Ensure the thread is added to active transfers
-                active_transfers.append(client_thread)
-            client_thread.start()
+            if parsed["type"] in FileTransferProtocol.PROTO_CONST:
+                handle_ack_nack(server, client_addr, data)  # Handle ACK/NACK within existing transfer
+            else:
+                client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
+                client_thread.start()
+        except socket.timeout:
+            print("Timeout occurred, retrying...")
+            time.sleep(10)
+            continue  # Prevent termination due to TimeoutError
 
 if __name__ == "__main__":
     main()

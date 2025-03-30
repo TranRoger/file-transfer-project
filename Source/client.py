@@ -8,7 +8,7 @@ import sys
 import hashlib
 import base64
 
-CHUNK_SIZE = 1024
+CHUNK_SIZE = 1024*2
 RECEIVE_SIZE = CHUNK_SIZE * 16
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
@@ -67,26 +67,6 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
         'socket_id': socket_id,
     }
     sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-    
-    # # Wait for the server to respond with ACK for the download request
-    # while True:
-    #     try:
-    #         sock.settimeout(5)
-    #         data, _ = sock.recvfrom(1024)
-    #         while not data:
-    #             data, _ = sock.recvfrom(1024)
-    #         packet = parse_response(data)
-    #         # print(f"Received packet for ACK download: {packet}")
-    #         if packet and packet['type'] == FileTransferProtocol.ACK:
-    #             print(f"Received ACK for {file_name} part {part_num}")
-    #             break
-    #         else:
-    #             print(f"Unexpected packet type: {packet['type']}")
-    #     except socket.timeout:
-    #         print(f"Timeout while waiting for ACK for {file_name} part {part_num}")
-    #         # Resend the request if no ACK received
-    #         sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-
     
     # Initialize storage for received data
     received_data = {}
