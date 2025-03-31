@@ -5,7 +5,8 @@ import time
 import base64
 import threading
 
-CHUNK_SIZE = 1024*2
+MULTIPLIER = 8
+CHUNK_SIZE = 1024 * MULTIPLIER
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -18,7 +19,7 @@ class FileTransferProtocol:
     REQUEST_CONST = ['LIST', 'DOWNLOAD']
 
     @staticmethod
-    def create_packet(packet_type, file_name, sequence, data=None, total_chunks=None, checksum=None):
+    def create_packet(packet_type, file_name, sequence, data=None, total_chunks=None, checksum=None, offset=None):
         """Create a structured packet for file transfer."""
         packet = {
             'type': packet_type,
@@ -35,6 +36,10 @@ class FileTransferProtocol:
         
         if checksum is not None:
             packet['checksum'] = checksum
+
+        # For ACK-DOWNLOAD
+        if offset is not None:
+            packet['offset'] = offset
         
         return json.dumps(packet).encode()
 
@@ -77,6 +82,7 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
             
             # Send START packet
             # wait for ACK
+            print(f"Sending START packet for {file_name} to {client_addr}")
             send_start_packet(sock, client_addr, file_name, total_chunks)
             while True:
                 # Wait for ACK with timeout
@@ -87,11 +93,17 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                     
                     # If ACK received, break the loop
                     if parsed['type'] == FileTransferProtocol.ACK and parsed['file_name'] == file_name and parsed['sequence'] == 0 and parsed['offset'] == offset:
+                        print(f"ACK received for START packet for {file_name}")
                         break
+                    else:
+                        print(f"Unexpected response: {parsed}")
+                        send_start_packet(sock, client_addr, file_name, total_chunks)
+
                 except socket.timeout:
                     # Timeout - resend START packet
                     print("Timeout - resending START packet")
                     send_start_packet(sock, client_addr, file_name, total_chunks)
+                    continue
             
             
             # Send data chunks
@@ -110,9 +122,6 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
                     data=chunk
                 )
                 sock.sendto(data_packet, client_addr)
-                
-                # time.sleep(0.05)
-
                 # Wait for ACK with timeout
                 try:
                     sock.settimeout(1)  # 2-second timeout
@@ -156,6 +165,7 @@ def send_file_chunk(sock, client_addr, file_name, offset, length):
         )
         sock.sendto(error_packet, client_addr)
 
+
 def parse_packet(response):
     """Parse the incoming response from the client."""
     # expecting json format
@@ -188,6 +198,14 @@ def handle_client(server, client_addr, data):
         server.sendto(files_list.encode(), client_addr)
 
     elif parsed["type"] == "DOWNLOAD":
+        # Send ACK for DOWNLOAD request
+        ack_packet = FileTransferProtocol.create_packet(
+            FileTransferProtocol.ACK, 
+            parsed["file_name"], 
+            0, 
+            offset=parsed["offset"]
+        )
+        server.sendto(ack_packet, client_addr)
         # Start a thread for file transfer
         transfer_thread = threading.Thread(target=send_file_chunk, args=(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"]))
         with lock:
@@ -219,9 +237,9 @@ def main():
 
     while True:
         try:
-            receive_window = CHUNK_SIZE // 4
+            receive_window = 1024
             data, client_addr = server.recvfrom(receive_window)
-
+            print(f"Received data from {client_addr}")
             # Parse the packet type
             parsed = parse_packet(data)
 
@@ -232,7 +250,7 @@ def main():
                 client_thread.start()
         except socket.timeout:
             print("Timeout occurred, retrying...")
-            time.sleep(10)
+            time.sleep(5)
             continue  # Prevent termination due to TimeoutError
 
 if __name__ == "__main__":

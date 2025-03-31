@@ -8,8 +8,9 @@ import sys
 import hashlib
 import base64
 
-CHUNK_SIZE = 1024*2
-RECEIVE_SIZE = CHUNK_SIZE * 16
+MULTIPLIER = 4
+CHUNK_SIZE = 1024 * MULTIPLIER
+RECEIVE_SIZE = CHUNK_SIZE * 8
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -67,11 +68,28 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
         'socket_id': socket_id,
     }
     sock.sendto(json.dumps(request).encode("utf-8"), server_address)
-    
+    # Attempt to receive the ACK for the download request
+    while True:
+        try:
+            sock.settimeout(10)
+            rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
+            while not rawdata:
+                rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
+            packet = json.loads(rawdata.decode())
+            if packet['type'] == FileTransferProtocol.ACK and packet['file_name'] == file_name and packet['offset'] == offset:
+                print(f"Received ACK-DOWNLOAD for {file_name} part {part_num}")
+                break
+        except socket.timeout:
+            print(f"Timeout while waiting for ACK-DOWNLOAD for {file_name} part {part_num}")
+            # Send the request again
+            sock.sendto(json.dumps(request).encode("utf-8"), server_address)
+            continue
+
     # Initialize storage for received data
     received_data = {}
     total_chunks = -1
-    file_metadata = None
+    # create dictionary to store received sequence_numbers which all set to false except the first one
+    received_seq = {}
 
     while True:
         try:
@@ -86,6 +104,8 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
             # Handle different packet types
             if packet['type'] == FileTransferProtocol.START_CHUNK:
                 total_chunks = packet.get('total_chunks', -1)
+                received_seq = {i: False for i in range(total_chunks)}
+                received_seq[0] = True
                 file_metadata = packet
                 print(f"Received START packet for {file_name} part {part_num}")
                 # Send ACK for START packet
@@ -104,6 +124,8 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                 checksum = packet['checksum']
                 
                 if FileTransferProtocol.verify_checksum(chunk_data, checksum):
+                    # Store the sequence number that was received
+                    received_seq[packet['sequence']] = True
                     # ACK the chunk
                     ack_packet = json.dumps({
                         'type': FileTransferProtocol.ACK,
@@ -118,7 +140,7 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
                     
                     # Update progress
                     with progress_lock:
-                        progress[part_num] = (len(received_data) * 1024, length)
+                        progress[part_num] = (len(received_data) * CHUNK_SIZE, length)
                 else:
                     # Send NACK if checksum fails
                     nack_packet = json.dumps({
@@ -135,6 +157,41 @@ def download_part(sock, socket_id, file_name, offset, length, output_file, part_
 
         except socket.timeout:
             print(f"Timeout while downloading {file_name} part {part_num}")
+
+    # get all the false values in the received_seq dictionary
+    missing_chunks = {i: False for i, received in received_seq.items() if not received}
+    # Resend missing chunks
+    if missing_chunks:
+        print(f"Missing chunks: {missing_chunks}")
+        while not all(received_seq.values()):
+            # Resend missing chunks
+            for seq in missing_chunks:
+                resend_packet = json.dumps({
+                    'type': FileTransferProtocol.DATA_CHUNK,
+                    'file_name': file_name,
+                    'sequence': seq,
+                    'offset': offset
+                }).encode()
+                sock.sendto(resend_packet, server_address)
+                print(f"Resending chunk {seq} for {file_name} part {part_num}")
+            
+            # Wait for ACKs for the resent packets
+            try:
+                sock.settimeout(10)  # 10-second timeout
+                rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
+                while not rawdata:
+                    rawdata, _ = sock.recvfrom(RECEIVE_SIZE)
+                packet = json.loads(rawdata.decode())
+                
+                if packet['type'] == FileTransferProtocol.ACK and missing_chunks.get(packet['sequence'], False):
+                    # Store the sequence number that was received
+                    missing_chunks[packet['sequence']] = True
+                    # Update progress
+                    with progress_lock:
+                        progress[part_num] = (len(received_data) * 1024, length)
+                        
+            except socket.timeout:
+                print(f"Timeout while waiting for ACKs for {file_name} part {part_num}")    
 
     # Reconstruct and write file
     if total_chunks > 0 and len(received_data) == total_chunks:
@@ -195,7 +252,7 @@ def main():
                 
                 # Display progress
                 while any(t.is_alive() for t in threads):
-                    time.sleep(1)
+                    time.sleep(2)
                     with progress_lock:
                         for i in range(4):
                             received, total = progress[i]
