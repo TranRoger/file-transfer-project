@@ -1,0 +1,4 @@
+50MB.zip 50MB
+10MB.zip 10MB
+20MB.zip 20MB
+1GB.zip 1GB
