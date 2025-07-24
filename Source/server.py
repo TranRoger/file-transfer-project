@@ -3,10 +3,18 @@ import json
 import hashlib
 import time
 import base64
-import threading
+import select
+import os
+from collections import namedtuple
 
 MULTIPLIER = 8
 CHUNK_SIZE = 1024 * MULTIPLIER
+
+# Define client state constants
+IDLE = 0
+SENDING_FILE = 1
+WAITING_ACK = 2
+
 class FileTransferProtocol:
     """Application-level protocol for reliable file transfer."""
     # Protocol constants
@@ -183,75 +191,308 @@ def parse_packet(response):
         print("Invalid response format")
         return None, None, None
 
-active_transfers = []
-lock = threading.Lock()  # To safely modify active_transfers
+# Client state structure
+ClientState = namedtuple('ClientState', ['state', 'file_name', 'offset', 'length', 'current_seq', 'total_chunks', 'last_activity'])
 
-def handle_client(server, client_addr, data):
-    """Handle client requests for LIST and DOWNLOAD."""
-    parsed = parse_packet(data)
-    print(f"Received request from {client_addr}: {parsed}")
+def prepare_file_chunk(file_name, offset, seq, chunk_size):
+    """Prepare a file chunk for sending."""
+    try:
+        with open(file_name, "rb") as f:
+            f.seek(offset + seq * chunk_size)
+            chunk = f.read(chunk_size)
+            
+            # Calculate checksum for this chunk
+            checksum = hashlib.md5(chunk).hexdigest()
+            
+            return chunk, checksum
+    except (FileNotFoundError, IOError) as e:
+        print(f"Error reading file: {e}")
+        return None, None
 
-    if parsed["type"] == "LIST":
-        # Send list of available files
-        with open("files.txt", "r") as f:
-            files_list = f.read()
-        server.sendto(files_list.encode(), client_addr)
+def handle_list_request(sock, client_addr):
+    """Handle LIST request from client."""
+    with open("files.txt", "r") as f:
+        files_list = f.read()
+    sock.sendto(files_list.encode(), client_addr)
+    return True
 
-    elif parsed["type"] == "DOWNLOAD":
-        # Send ACK for DOWNLOAD request
-        ack_packet = FileTransferProtocol.create_packet(
-            FileTransferProtocol.ACK, 
-            parsed["file_name"], 
-            0, 
-            offset=parsed["offset"]
-        )
-        server.sendto(ack_packet, client_addr)
-        # Start a thread for file transfer
-        transfer_thread = threading.Thread(target=send_file_chunk, args=(server, client_addr, parsed["file_name"], parsed["offset"], parsed["length"]))
-        with lock:
-            active_transfers.append(transfer_thread)
-        transfer_thread.start()
-        transfer_thread.join()  # Wait for the thread to finish
+def handle_download_request(sock, client_addr, parsed, client_states):
+    """Handle DOWNLOAD request from client."""
+    file_name = parsed["file_name"]
+    offset = parsed["offset"]
+    length = parsed["length"]
+    
+    # Send ACK for DOWNLOAD request
+    ack_packet = FileTransferProtocol.create_packet(
+        FileTransferProtocol.ACK, 
+        file_name, 
+        0, 
+        offset=offset
+    )
+    sock.sendto(ack_packet, client_addr)
+    
+    # Calculate total chunks
+    chunk_size = CHUNK_SIZE
+    try:
+        file_size = os.path.getsize(file_name)
+        actual_length = min(length, file_size - offset)
+        total_chunks = (actual_length + chunk_size - 1) // chunk_size
         
-        with lock:
-            active_transfers.remove(transfer_thread)
+        # Initialize client state for file transfer
+        client_states[client_addr] = ClientState(
+            state=SENDING_FILE,
+            file_name=file_name,
+            offset=offset,
+            length=actual_length,
+            current_seq=0,  # Start with sequence 0 (START packet)
+            total_chunks=total_chunks,
+            last_activity=time.time()
+        )
+        
+        # Start by sending START packet
+        start_packet = FileTransferProtocol.create_packet(
+            FileTransferProtocol.START_CHUNK,
+            file_name,
+            0,
+            total_chunks=total_chunks
+        )
+        sock.sendto(start_packet, client_addr)
+        
+        # Update client state to waiting for ACK
+        client_states[client_addr] = ClientState(
+            state=WAITING_ACK,
+            file_name=file_name,
+            offset=offset,
+            length=actual_length,
+            current_seq=0,
+            total_chunks=total_chunks,
+            last_activity=time.time()
+        )
+        
+        return True
+    except FileNotFoundError:
+        error_packet = FileTransferProtocol.create_packet(
+            'ERROR',
+            file_name,
+            0,
+            data=f"File {file_name} not found".encode()
+        )
+        sock.sendto(error_packet, client_addr)
+        return False
 
-def handle_ack_nack(server, client_addr, data):
-    """Process ACK/NACK packets and direct them to the correct file transfer thread."""
-    parsed = parse_packet(data)
-    print(f"Received ACK/NACK from {client_addr}: {parsed}")
+def handle_ack(sock, client_addr, parsed, client_states):
+    """Handle ACK from client."""
+    if client_addr not in client_states:
+        return False
+    
+    state = client_states[client_addr]
+    if parsed["file_name"] != state.file_name:
+        return False
+    
+    # Update last activity time
+    client_states[client_addr] = ClientState(
+        state=state.state,
+        file_name=state.file_name,
+        offset=state.offset,
+        length=state.length,
+        current_seq=state.current_seq,
+        total_chunks=state.total_chunks,
+        last_activity=time.time()
+    )
+    
+    if state.state == WAITING_ACK and parsed["sequence"] == 0 and parsed["type"] == FileTransferProtocol.ACK:
+        # ACK for START packet received, start sending data
+        client_states[client_addr] = ClientState(
+            state=SENDING_FILE,
+            file_name=state.file_name,
+            offset=state.offset,
+            length=state.length,
+            current_seq=1,  # Move to first data packet
+            total_chunks=state.total_chunks,
+            last_activity=time.time()
+        )
+        
+        # Send first data packet
+        chunk, checksum = prepare_file_chunk(state.file_name, state.offset, 0, CHUNK_SIZE)
+        if chunk:
+            data_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.DATA_CHUNK,
+                state.file_name,
+                1,
+                data=chunk,
+                checksum=checksum
+            )
+            sock.sendto(data_packet, client_addr)
+            
+            # Update client state
+            client_states[client_addr] = ClientState(
+                state=WAITING_ACK,
+                file_name=state.file_name,
+                offset=state.offset,
+                length=state.length,
+                current_seq=1,
+                total_chunks=state.total_chunks,
+                last_activity=time.time()
+            )
+    
+    elif state.state == WAITING_ACK and parsed["sequence"] == state.current_seq:
+        # ACK for data packet received
+        next_seq = state.current_seq + 1
+        
+        if next_seq <= state.total_chunks:
+            # Send next data packet
+            chunk, checksum = prepare_file_chunk(state.file_name, state.offset, next_seq - 1, CHUNK_SIZE)
+            if chunk:
+                data_packet = FileTransferProtocol.create_packet(
+                    FileTransferProtocol.DATA_CHUNK,
+                    state.file_name,
+                    next_seq,
+                    data=chunk,
+                    checksum=checksum
+                )
+                sock.sendto(data_packet, client_addr)
+                
+                # Update client state
+                client_states[client_addr] = ClientState(
+                    state=WAITING_ACK,
+                    file_name=state.file_name,
+                    offset=state.offset,
+                    length=state.length,
+                    current_seq=next_seq,
+                    total_chunks=state.total_chunks,
+                    last_activity=time.time()
+                )
+        else:
+            # All data packets sent, send END packet
+            end_packet = FileTransferProtocol.create_packet(
+                FileTransferProtocol.END_CHUNK,
+                state.file_name,
+                0
+            )
+            sock.sendto(end_packet, client_addr)
+            
+            # Mark transfer as complete
+            client_states[client_addr] = ClientState(
+                state=IDLE,
+                file_name="",
+                offset=0,
+                length=0,
+                current_seq=0,
+                total_chunks=0,
+                last_activity=time.time()
+            )
+    
+    return True
 
-    with lock:
-        if client_addr in active_transfers:
-            transfer_thread = active_transfers[client_addr]
-            if transfer_thread.is_alive():
-                # Notify the transfer thread (e.g., using a queue or shared variable)
-                print(f"Notifying transfer thread of ACK/NACK for {client_addr}")
-                # You can implement a queue-based approach here for better control.
+def handle_nack(sock, client_addr, parsed, client_states):
+    """Handle NACK from client."""
+    if client_addr not in client_states:
+        return False
+    
+    state = client_states[client_addr]
+    if parsed["file_name"] != state.file_name:
+        return False
+    
+    # Resend the requested packet
+    seq = parsed["sequence"]
+    chunk, checksum = prepare_file_chunk(state.file_name, state.offset, seq - 1, CHUNK_SIZE)
+    if chunk:
+        data_packet = FileTransferProtocol.create_packet(
+            FileTransferProtocol.DATA_CHUNK,
+            state.file_name,
+            seq,
+            data=chunk,
+            checksum=checksum
+        )
+        sock.sendto(data_packet, client_addr)
+    
+    return True
+
+def check_timeouts(sock, client_states, timeout=5):
+    """Check for client timeouts and resend packets if needed."""
+    current_time = time.time()
+    for client_addr, state in list(client_states.items()):
+        if current_time - state.last_activity > timeout:
+            if state.state == WAITING_ACK:
+                # Resend the last packet
+                if state.current_seq == 0:
+                    # Resend START packet
+                    start_packet = FileTransferProtocol.create_packet(
+                        FileTransferProtocol.START_CHUNK,
+                        state.file_name,
+                        0,
+                        total_chunks=state.total_chunks
+                    )
+                    sock.sendto(start_packet, client_addr)
+                else:
+                    # Resend data packet
+                    chunk, checksum = prepare_file_chunk(state.file_name, state.offset, state.current_seq - 1, CHUNK_SIZE)
+                    if chunk:
+                        data_packet = FileTransferProtocol.create_packet(
+                            FileTransferProtocol.DATA_CHUNK,
+                            state.file_name,
+                            state.current_seq,
+                            data=chunk,
+                            checksum=checksum
+                        )
+                        sock.sendto(data_packet, client_addr)
+            
+            # Update last activity time
+            client_states[client_addr] = ClientState(
+                state=state.state,
+                file_name=state.file_name,
+                offset=state.offset,
+                length=state.length,
+                current_seq=state.current_seq,
+                total_chunks=state.total_chunks,
+                last_activity=current_time
+            )
 
 def main():
-    """Start the UDP server."""
+    """Start the UDP server with select-based I/O multiplexing."""
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    server.bind(("10.250.91.1", 12345))
+    server.bind(("192.168.1.23", 12345))
+    server.setblocking(False)  # Set socket to non-blocking mode
     print("UDP Server listening on port 12345...")
-
+    
+    # Dictionary to store client states
+    client_states = {}
+    
+    # Buffer for received data
+    receive_window = 1024 * 4
+    
     while True:
-        try:
-            receive_window = 1024
-            data, client_addr = server.recvfrom(receive_window)
-            print(f"Received data from {client_addr}")
-            # Parse the packet type
-            parsed = parse_packet(data)
-
-            if parsed["type"] in FileTransferProtocol.PROTO_CONST:
-                handle_ack_nack(server, client_addr, data)  # Handle ACK/NACK within existing transfer
-            else:
-                client_thread = threading.Thread(target=handle_client, args=(server, client_addr, data))
-                client_thread.start()
-        except socket.timeout:
-            print("Timeout occurred, retrying...")
-            time.sleep(5)
-            continue  # Prevent termination due to TimeoutError
+        # Check for timeouts
+        check_timeouts(server, client_states)
+        
+        # Use select to wait for incoming data with timeout
+        ready_sockets, _, _ = select.select([server], [], [], 1.0)  # 1 second timeout
+        
+        for sock in ready_sockets:
+            try:
+                data, client_addr = sock.recvfrom(receive_window)
+                parsed = parse_packet(data)
+                
+                if not parsed:
+                    continue
+                
+                print(f"Received request from {client_addr}: {parsed}")
+                
+                # Handle different packet types
+                if parsed["type"] == "LIST":
+                    handle_list_request(server, client_addr)
+                elif parsed["type"] == "DOWNLOAD":
+                    handle_download_request(server, client_addr, parsed, client_states)
+                elif parsed["type"] == FileTransferProtocol.ACK:
+                    handle_ack(server, client_addr, parsed, client_states)
+                elif parsed["type"] == FileTransferProtocol.NACK:
+                    handle_nack(server, client_addr, parsed, client_states)
+            except BlockingIOError:
+                # No data available, continue
+                continue
+            except Exception as e:
+                print(f"Error handling client: {e}")
+                continue
 
 if __name__ == "__main__":
     main()
